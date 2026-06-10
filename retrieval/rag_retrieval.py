@@ -1265,12 +1265,14 @@ def _select_components(
 
 _SIZE_TIER_ORDER = ["nano", "small", "base", "large", "xlarge"]
 
-# special_case backbone → 触发它出现所需的 constraint 字段
+# special_case backbone → 触发它出现所需的 constraint 字段（任一命中即激活）
 # 不在此表里的 special_case backbone 视为"宽松特殊"，无约束也保留
-_SPECIAL_CASE_REQUIRES: dict[str, str] = {
-    "mobilenet_v3": "edge_deployment",
-    "unet":         "medical",
-    "clip_vit":     "cross_modal",
+# clip_vit 同时响应 zero_shot：CLIP 是零样本分类的首选模型，
+# 仅靠 cross_modal 激活会把它挡在纯零样本查询之外
+_SPECIAL_CASE_REQUIRES: dict[str, tuple[str, ...]] = {
+    "mobilenet_v3": ("edge_deployment",),
+    "unet":         ("medical",),
+    "clip_vit":     ("cross_modal", "zero_shot"),
 }
 
 
@@ -1423,7 +1425,7 @@ def _filter_by_tier(
         elif tier == "special_case":
             required = _SPECIAL_CASE_REQUIRES.get(backbone_id)
             if required:
-                if c.get(required):
+                if any(c.get(key) for key in required):
                     result.append((backbone_id, checkpoint_id))
             elif backbone_id == "yolov8" and task_type == "image_segmentation":
                 if c.get("real_time") or c.get("edge_deployment"):
