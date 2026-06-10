@@ -23,9 +23,11 @@ from .schemas import TrainingSpec
 # Provider 抽象
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _call_llm(system_prompt: str, user_prompt: str) -> str | None:
-    """调用 LLM，返回原始文本。失败返回 None。"""
-    provider = get_provider()
+def _call_llm(system_prompt: str, user_prompt: str, provider: str | None = None) -> str | None:
+    """调用 LLM，返回原始文本。失败返回 None。
+
+    provider 为 None 时回退到 M4_LLM_PROVIDER 环境变量。"""
+    provider = (provider or get_provider()).strip().lower()
 
     if provider == "none":
         return None
@@ -56,6 +58,7 @@ def _call_qwen(system_prompt: str, user_prompt: str) -> str | None:
         )
         resp = client.chat.completions.create(
             model=os.environ.get("M4_QWEN_MODEL", "qwen-plus"),
+            temperature=0,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -74,6 +77,7 @@ def _call_openai(system_prompt: str, user_prompt: str) -> str | None:
         client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
         resp = client.chat.completions.create(
             model=os.environ.get("M4_OPENAI_MODEL", "gpt-4o"),
+            temperature=0,
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_prompt},
@@ -89,7 +93,7 @@ def _call_vertex(system_prompt: str, user_prompt: str) -> str | None:
     try:
         load_env_file()
         import vertexai
-        from vertexai.generative_models import GenerativeModel
+        from vertexai.generative_models import GenerationConfig, GenerativeModel
 
         project = os.environ.get("M4_VERTEX_PROJECT", "my-agent-498201")
         location = os.environ.get("M4_VERTEX_LOCATION", "us-central1")
@@ -97,7 +101,7 @@ def _call_vertex(system_prompt: str, user_prompt: str) -> str | None:
 
         vertexai.init(project=project, location=location)
         model = GenerativeModel(model_name, system_instruction=system_prompt)
-        resp = model.generate_content(user_prompt)
+        resp = model.generate_content(user_prompt, generation_config=GenerationConfig(temperature=0.0))
         return resp.text
     except Exception as e:
         print(f"[LLM] Vertex AI call failed: {e}")
@@ -174,7 +178,7 @@ CRITICAL — forward() return types (the template train.py and evaluate.py depen
 # 公开接口
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def generate_model_py(spec: TrainingSpec, feedback: str = "") -> str | None:
+def generate_model_py(spec: TrainingSpec, feedback: str = "", provider: str | None = None) -> str | None:
     """用 LLM 生成 model.py（使用 model_utils helper）。失败返回 None。"""
     prompt = _MODEL_PY_PROMPT.format(
         task_type=spec.task_type,
@@ -183,5 +187,5 @@ def generate_model_py(spec: TrainingSpec, feedback: str = "") -> str | None:
     )
     if feedback:
         prompt += f"\n\nPrevious attempt failed with this feedback:\n{feedback}\nFix the issues."
-    raw = _call_llm(_SYSTEM_PROMPT, prompt)
+    raw = _call_llm(_SYSTEM_PROMPT, prompt, provider=provider)
     return _extract_python(raw) if raw else None

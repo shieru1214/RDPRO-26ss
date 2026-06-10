@@ -28,8 +28,15 @@ REQUIRED_GENERATED_FILES = (
 )
 
 
-def generate_files(specs: Sequence[TrainingSpec], feedback: str | None = None) -> GeneratedFiles:
-    """Return generated project files keyed by relative path."""
+def generate_files(
+    specs: Sequence[TrainingSpec],
+    feedback: str | None = None,
+    llm_provider: str | None = None,
+) -> GeneratedFiles:
+    """Return generated project files keyed by relative path.
+
+    ``llm_provider`` overrides the M4_LLM_PROVIDER environment variable.
+    """
 
     if not specs:
         raise ValueError("At least one TrainingSpec is required.")
@@ -37,9 +44,9 @@ def generate_files(specs: Sequence[TrainingSpec], feedback: str | None = None) -
     configs_json = json.dumps(specs_to_configs(specs), indent=2, sort_keys=True)
     first_config_json = json.dumps(specs[0].to_config(), indent=2, sort_keys=True)
 
-    provider = get_provider()
+    provider = (llm_provider or get_provider()).strip().lower()
     # LLM 只生成 model.py（使用 model_utils helper），train/evaluate 始终用模板
-    llm_model = generate_model_py(specs[0], feedback=feedback or "")
+    llm_model = generate_model_py(specs[0], feedback=feedback or "", provider=provider)
     model_source = provider if llm_model else "template"
 
     files = {
@@ -325,6 +332,45 @@ def _model_utils_py() -> str:
                 return self.layers(x)
 
 
+        class _HFBackbone(nn.Module):
+            """Wraps a transformers AutoModel to emit plain feature tensors.
+
+            Transformer encoders return [B, seq, D]; we mean-pool to [B, D] so
+            heads can treat the output like any 2D feature vector.
+            """
+
+            def __init__(self, model: nn.Module) -> None:
+                super().__init__()
+                self.model = model
+
+            def forward(self, x: torch.Tensor) -> torch.Tensor:
+                out = self.model(pixel_values=x)
+                hidden = getattr(out, "last_hidden_state", None)
+                if hidden is None:
+                    hidden = out[0] if isinstance(out, (tuple, list)) else out
+                if hidden.dim() == 3:
+                    return hidden.mean(dim=1)
+                return hidden
+
+
+        def _try_huggingface(hf_id: str, image_size: int) -> tuple[nn.Module, int] | None:
+            """Load the exact HuggingFace checkpoint chosen by Module 3.
+
+            Requires the optional ``transformers`` dependency and network access
+            on first download. Returns None on any failure so the caller can
+            fall back to torchvision.
+            """
+            try:
+                from transformers import AutoModel
+                model = AutoModel.from_pretrained(hf_id)
+                backbone = _HFBackbone(model)
+                channels = _infer_channels(backbone, image_size)
+                return backbone, channels
+            except Exception as exc:
+                print(f"[model_utils] HuggingFace checkpoint {hf_id!r} unavailable ({exc}); falling back.")
+                return None
+
+
         def _try_torchvision(name: str, pretrained: bool = False) -> nn.Module | None:
             try:
                 import torchvision.models as tv
@@ -380,12 +426,14 @@ def _model_utils_py() -> str:
             """Load backbone and return (backbone_module, out_channels).
 
             The backbone outputs spatial features [B, C, H', W'] for CNN models.
-            Transformer models may return [B, D]. Falls back to TinyBackbone
+            Transformer models return [B, D]. Falls back to TinyBackbone
             if the requested model is unavailable.
 
-            When ``use_pretrained`` is true in *config*, torchvision DEFAULT
-            weights are loaded automatically — unless ``offline_smoke`` is
-            also true, which forces random init so smoke runs never download.
+            When ``use_pretrained`` is true in *config*, the exact HuggingFace
+            checkpoint in ``pretrained_hf_id`` is loaded first (needs the
+            optional ``transformers`` package); failing that, torchvision
+            DEFAULT weights for the named backbone. ``offline_smoke`` forces
+            random init so smoke runs never download anything.
             """
             config = config or {}
             name = str(get_value(config, "backbone", "tiny_cnn")).lower()
@@ -393,6 +441,13 @@ def _model_utils_py() -> str:
             pretrained = as_bool(get_value(config, "use_pretrained", False), False)
             if as_bool(get_value(config, "offline_smoke", False), False):
                 pretrained = False
+
+            if pretrained:
+                hf_id = str(get_value(config, "pretrained_hf_id", "") or "").strip()
+                if hf_id:
+                    loaded = _try_huggingface(hf_id, image_size)
+                    if loaded is not None:
+                        return loaded
 
             model = _try_torchvision(name, pretrained=pretrained)
             if model is None:
@@ -1093,11 +1148,17 @@ def _readme_generated_md(
 
         ## Smoke vs Real Training
 
-        The generated code uses dummy local models by default and does not
-        download HuggingFace checkpoints. Replace `build_model` or set up real
-        checkpoint loading when moving to Colab/GPU training. The local smoke
-        path verifies tensor shapes, loss computation, backward pass, optimizer
-        step, evaluation output, inference output, and experiment sweep coverage.
+        Smoke runs (`offline_smoke: true`, the default) never download weights:
+        backbones are randomly initialized so the checks stay fast and offline.
+        The local smoke path verifies tensor shapes, loss computation, backward
+        pass, optimizer step, evaluation output, inference output, and
+        experiment sweep coverage.
+
+        For real training, set `offline_smoke: false` and keep
+        `use_pretrained: true` in the config. `model_utils.load_backbone` then
+        loads the exact `pretrained_hf_id` checkpoint chosen by Module 3
+        (requires `pip install transformers`), falling back to torchvision
+        DEFAULT weights, then to random init, if unavailable.
 
         ## Current Limitations
 

@@ -9,6 +9,7 @@ from typing import Any
 from .code_generator import generate_files
 from .executor import run_smoke, write_generated_files
 from .experiment_loop import run_refinement_loop
+from .llm_codegen import get_provider
 from .reviewer import review_generated
 from .schemas import IterationRecord, SmokeResult, WorkflowResult
 from .spec_builder import build_training_specs
@@ -40,11 +41,16 @@ def run_workflow(
     run_refinement: bool = False,
     max_refinement_iters: int = 2,
     improvement_threshold: float = 0.01,
+    llm_provider: str | None = None,
 ) -> WorkflowResult:
-    """Run generation, smoke execution, and static review."""
+    """Run generation, smoke execution, and static review.
+
+    ``llm_provider`` overrides the M4_LLM_PROVIDER environment variable.
+    """
 
     m3_configs = load_m3_configs(input_path)
     specs = build_training_specs(m3_configs)
+    provider = (llm_provider or get_provider()).strip().lower()
     feedback = ""
     generated = None
     smoke_result = None
@@ -54,7 +60,7 @@ def run_workflow(
 
     iterations = max(1, int(max_iter))
     for iteration in range(1, iterations + 1):
-        generated = generate_files(specs, feedback=feedback)
+        generated = generate_files(specs, feedback=feedback, llm_provider=provider)
         write_generated_files(generated, output_dir)
         smoke_result = SmokeResult(success=True, skipped=True) if skip_smoke else run_smoke(output_dir, timeout=timeout)
         review_result = review_generated(generated, specs, smoke_result=smoke_result, output_dir=output_dir)
@@ -71,6 +77,10 @@ def run_workflow(
             )
         )
         if review_result.is_approved:
+            iterations = iteration
+            break
+        if provider == "none":
+            # 模板生成是确定性的：再跑一轮产物完全相同，重试没有意义
             iterations = iteration
             break
     assert generated is not None

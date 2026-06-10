@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 from pathlib import Path
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -133,23 +132,14 @@ def run_module4_generation(
         encoding="utf-8",
     )
 
-    previous_provider = os.environ.get("M4_LLM_PROVIDER")
-    if llm_provider:
-        os.environ["M4_LLM_PROVIDER"] = llm_provider
-    try:
-        result = run_workflow(
-            module4_input,
-            output_path,
-            timeout=timeout,
-            skip_smoke=skip_smoke,
-            run_refinement=run_refinement,
-        )
-    finally:
-        if llm_provider:
-            if previous_provider is None:
-                os.environ.pop("M4_LLM_PROVIDER", None)
-            else:
-                os.environ["M4_LLM_PROVIDER"] = previous_provider
+    result = run_workflow(
+        module4_input,
+        output_path,
+        timeout=timeout,
+        skip_smoke=skip_smoke,
+        run_refinement=run_refinement,
+        llm_provider=llm_provider,
+    )
 
     return {
         "input_path": str(module4_input),

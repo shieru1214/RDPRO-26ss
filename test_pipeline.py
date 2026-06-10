@@ -163,7 +163,7 @@ class TestMergeModules(unittest.TestCase):
 
 class TestModule4Handoff(unittest.TestCase):
 
-    def test_run_module4_generation_writes_input_and_restores_provider(self):
+    def test_run_module4_generation_writes_input_and_passes_provider(self):
         task_lists = [
             {
                 "format": "nl",
@@ -187,10 +187,10 @@ class TestModule4Handoff(unittest.TestCase):
 
         captured = {}
 
-        def fake_run_workflow(input_path, output_dir, *, timeout, skip_smoke, run_refinement):
+        def fake_run_workflow(input_path, output_dir, *, timeout, skip_smoke, run_refinement, llm_provider=None):
             captured["input_path"] = Path(input_path)
             captured["output_dir"] = Path(output_dir)
-            captured["provider_during_call"] = os.environ.get("M4_LLM_PROVIDER")
+            captured["llm_provider"] = llm_provider
             captured["timeout"] = timeout
             captured["skip_smoke"] = skip_smoke
             captured["run_refinement"] = run_refinement
@@ -211,11 +211,12 @@ class TestModule4Handoff(unittest.TestCase):
             self.assertTrue(input_path.exists())
             self.assertEqual(json.loads(input_path.read_text(encoding="utf-8")), task_lists)
             self.assertEqual(result["summary"], {"status": "approved"})
-            self.assertEqual(captured["provider_during_call"], "qwen")
+            self.assertEqual(captured["llm_provider"], "qwen")
             self.assertEqual(captured["timeout"], 7)
             self.assertTrue(captured["skip_smoke"])
             self.assertTrue(captured["run_refinement"])
 
+        # provider 改为参数传递，环境变量不应被触碰
         self.assertEqual(os.environ.get("M4_LLM_PROVIDER"), previous_provider)
 
 
