@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .ablation import CONTROLLED_FIELDS, diff_controlled_fields, has_forbidden_field_changes
 from .code_generator import REQUIRED_GENERATED_FILES
+from .refinement import METRIC_BY_TASK as PROXY_METRIC_BY_TASK
 from .schemas import GeneratedFiles, ReviewResult, SmokeResult, TrainingSpec
 
 
@@ -162,10 +163,21 @@ def _check_important_fields(
     errors: list[str],
     warnings: list[str],
 ) -> None:
+    try:
+        configs = json.loads(files.get("configs.json", ""))
+    except json.JSONDecodeError:
+        return  # _check_configs_json already reports invalid JSON
+    if not isinstance(configs, list):
+        return
+    for config in configs:
+        if not isinstance(config, dict):
+            continue
+        missing = [field for field in IMPORTANT_FIELDS if field not in config]
+        if missing:
+            errors.append(
+                f"configs.json entry rank {config.get('rank')!r} is missing model_config fields: {missing}"
+            )
     combined = "\n".join(files.values())
-    for field in IMPORTANT_FIELDS:
-        if field not in combined:
-            errors.append(f"Important model_config field is not represented: {field}")
     for spec in specs:
         for value in (spec.task_type, spec.backbone, spec.loss, spec.optimizer, spec.finetune_strategy):
             if value and str(value) not in combined:
@@ -349,7 +361,7 @@ def _check_experiment_rows(rows: list[dict[str, object]], errors: list[str]) -> 
             )
         task_type = str(row.get("task_type"))
         metric_name = str(row.get("metric_name"))
-        if metric_name not in METRICS_BY_TASK.get(task_type, set()):
+        if metric_name != PROXY_METRIC_BY_TASK.get(task_type):
             errors.append(f"Refinement metric {metric_name!r} does not match task type {task_type!r}.")
         if row.get("status") != "success":
             errors.append(f"Experiment row {row.get('experiment_id')!r} did not succeed.")

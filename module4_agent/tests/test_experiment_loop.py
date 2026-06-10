@@ -44,7 +44,7 @@ def test_proxy_baseline_result_generation_is_task_specific():
     result = proxy_evaluate(spec, experiment_id="baseline", stage="baseline")
 
     assert result.stage == "baseline"
-    assert result.metric_name == "accuracy"
+    assert result.metric_name == "proxy_accuracy"
     assert result.status == "success"
     assert result.config_summary["task_type"] == "classification"
 
@@ -63,7 +63,7 @@ def test_proxy_metric_names_cover_all_supported_tasks():
         for index, spec in enumerate(specs)
     ]
 
-    assert names == ["accuracy", "mAP@0.5", "mIoU", "recall@1"]
+    assert names == ["proxy_accuracy", "proxy_mAP@0.5", "proxy_mIoU", "proxy_recall@1"]
 
 
 def test_ablation_variants_modify_one_component_only():
@@ -112,7 +112,7 @@ def test_select_best_result_rejects_all_failed_results():
         parent_id=None,
         stage="baseline",
         modified_component=None,
-        metric_name="accuracy",
+        metric_name="proxy_accuracy",
         metric_value=0.0,
         status="failed",
         config_summary={"task_type": "classification"},

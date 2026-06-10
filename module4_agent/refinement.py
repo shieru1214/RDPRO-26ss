@@ -15,11 +15,12 @@ from .executor import subprocess_env
 from .schemas import ExperimentResult, TrainingSpec
 
 
+# proxy_ 前缀强调这是本地启发式代理分数，不是真实 benchmark 指标
 METRIC_BY_TASK = {
-    "classification": "accuracy",
-    "object_detection": "mAP@0.5",
-    "image_segmentation": "mIoU",
-    "feature_extraction": "recall@1",
+    "classification": "proxy_accuracy",
+    "object_detection": "proxy_mAP@0.5",
+    "image_segmentation": "proxy_mIoU",
+    "feature_extraction": "proxy_recall@1",
 }
 
 
@@ -36,7 +37,7 @@ def proxy_evaluate(
 ) -> ExperimentResult:
     """Evaluate a TrainingSpec with a local proxy metric."""
 
-    metric_name = METRIC_BY_TASK.get(spec.task_type, "accuracy")
+    metric_name = METRIC_BY_TASK.get(spec.task_type, "proxy_accuracy")
     config_summary = training_spec_summary(spec)
     smoke_loss, smoke_note = _smoke_loss_signal(spec, smoke_project_dir=smoke_project_dir, seed=seed)
     score = _proxy_score(spec, seed=seed, smoke_loss=smoke_loss)
