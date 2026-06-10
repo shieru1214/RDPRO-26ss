@@ -167,16 +167,19 @@ print(json.dumps({"status": result.get("status"), "loss": result.get("loss")}))
 """
     payload = spec.to_config()
     payload["_seed"] = seed
-    completed = subprocess.run(
-        [sys.executable, "-c", code],
-        cwd=str(project_dir),
-        input=json.dumps(payload),
-        capture_output=True,
-        text=True,
-        timeout=30,
-        env=subprocess_env(),
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", code],
+            cwd=str(project_dir),
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+            timeout=30,
+            env=subprocess_env(),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None, "Smoke-loss signal timed out."
     if completed.returncode != 0:
         return None, "Smoke-loss signal unavailable for this variant."
     try:

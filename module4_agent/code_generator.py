@@ -384,12 +384,15 @@ def _model_utils_py() -> str:
             if the requested model is unavailable.
 
             When ``use_pretrained`` is true in *config*, torchvision DEFAULT
-            weights are loaded automatically.
+            weights are loaded automatically — unless ``offline_smoke`` is
+            also true, which forces random init so smoke runs never download.
             """
             config = config or {}
             name = str(get_value(config, "backbone", "tiny_cnn")).lower()
             image_size = as_int(get_value(config, "image_size", 224), 224)
             pretrained = as_bool(get_value(config, "use_pretrained", False), False)
+            if as_bool(get_value(config, "offline_smoke", False), False):
+                pretrained = False
 
             model = _try_torchvision(name, pretrained=pretrained)
             if model is None:
