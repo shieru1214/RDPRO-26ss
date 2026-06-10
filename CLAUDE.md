@@ -10,6 +10,7 @@ Key files:
 - `ingestion/`, `analyzer/`, `processors/`, `features/` — Module 2: dataset loading and analysis (pipeline uses `ImageLoader` + `ImageStatisticsAnalyzer`)
 - `retrieval/rag_retrieval.py` — Module 3: the active KB and hybrid retrieval implementation
 - `retrieval/test_rag_retrieval.py` — Module 3 test suite (smoke, behavior, task list, zero_shot)
+- `retrieval/test_golden.py` — golden "query → expected recommendation" regression suite; run after any KB or scoring change (both suites need `cwd=retrieval/`)
 - `module4_agent/` — Module 4: code-generation agent (spec_builder → code_generator / llm_codegen → reviewer → smoke harness → refinement)
 - `docs/MODULE3_API.md` — API reference for Module 4, includes Module 2→3 interface alignment section
 - `docs/report_module3.md` — mid-term report material for Module 3
@@ -31,7 +32,7 @@ Two layers working together:
 ### Retrieval Pipeline (Hybrid — Scheme C, updated 2026-05-28)
 
 1. **Scale-band filter** — derive acceptable `size_tier` range from hard constraints (`edge_deployment` / `real_time` → `{nano, small}`; `data_size=small` → `{nano, small, base}`; etc.). Backbones with no in-band checkpoint and insufficient data for scratch training are excluded.
-2. **Tier filter** — `accuracy_upgrade` only when `priority=accuracy`; `special_case` requires its activating constraint (e.g. `medical`, `zero_shot`, `edge_deployment`). `zero_shot=True` is a hard filter: only backbones with `"zero_shot"` in `capabilities` pass.
+2. **Tier filter** — `accuracy_upgrade` only when `priority=accuracy`; `special_case` requires one of its activating constraints (`_SPECIAL_CASE_REQUIRES`, any-of semantics since 2026-06-10 — e.g. `clip_vit` activates on `cross_modal` OR `zero_shot`). `zero_shot=True` is a hard filter: only backbones with `"zero_shot"` in `capabilities` pass.
 3. **Structured scoring** — data_size match (0–2) + priority vs complexity (0–2) + `preferred_when` bonuses (+1.5 each) + `few_shot` capability bonus (+1.5). Normalised to [0, 1].
 4. **Vector scoring** — input converted to natural language, cosine similarity against backbone descriptions via `all-MiniLM-L6-v2`. Normalised to [0, 1].
 5. **Weighted merge** — structured 60% + vector 40% → Top 3.
@@ -95,8 +96,12 @@ See `docs/MODULE3_API.md` for full field reference and Module 2→3 alignment qu
                           #   cross_modal, medical,
                           #   zero_shot, few_shot   ← added 2026-05-28
     "description": str,   # free text, used for vector search
+    "num_classes": int,   # optional, from Module 2; ignored by retrieval,
+                          # injected into Module 4 model_config by pipeline.py
 }
 ```
+
+`data_size` derivation (in `pipeline.py`, 2026-06-10): dual signal — total-image tier (cost side; detection/segmentation thresholds halved) and images-per-class tier (overfitting side, classification only); the final tier is the more conservative of the two. See `docs/MODULE3_API.md` for the tables.
 
 ## Known Issues / Open Work
 

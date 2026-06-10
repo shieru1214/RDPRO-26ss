@@ -21,19 +21,50 @@ from pathlib import Path
 # Module 2 → Module 3 字段映射
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# 阈值来自 MODULE3_API.md
-_DATA_SIZE_THRESHOLDS = {
-    "small":  3_000,
-    "medium": 20_000,
+# 总量阈值 (small 上限, medium 上限)：总量决定标注/训练成本。
+# 检测和分割的单张标注成本是分类的 10-100 倍，阈值减半。
+_TOTAL_THRESHOLDS = {
+    "classification":     (3_000, 20_000),
+    "feature_extraction": (3_000, 20_000),
+    "object_detection":   (1_500, 10_000),
+    "image_segmentation": (1_500, 10_000),
 }
+_DEFAULT_TOTAL_THRESHOLDS = (3_000, 20_000)
 
-def derive_data_size(total_images: int) -> str:
-    """从图片总数推断 data_size。"""
-    if total_images <= _DATA_SIZE_THRESHOLDS["small"]:
+# 每类样本数阈值 (small 上限, medium 上限)：决定过拟合风险。
+# 仅分类任务使用——25k 张图分 200 类只有 125 张/类，是小数据不是大数据。
+_PER_CLASS_THRESHOLDS = (100, 1_000)
+
+_SIZE_ORDER = ["small", "medium", "large"]
+
+
+def _tier(value: float, thresholds: tuple[float, float]) -> str:
+    small_max, medium_max = thresholds
+    if value <= small_max:
         return "small"
-    if total_images <= _DATA_SIZE_THRESHOLDS["medium"]:
+    if value <= medium_max:
         return "medium"
     return "large"
+
+
+def derive_data_size(
+    total_images: int,
+    num_classes: int | None = None,
+    task_type: str = "classification",
+) -> str:
+    """从图片总数（+ 可选类别数）推断 data_size。
+
+    双信号取更保守一档：
+      - 总量档位：成本侧约束，总量不够大就不算大数据
+      - 每类样本数档位（仅分类）：过拟合侧约束，类多样本摊薄也不算大数据
+    """
+    by_total = _tier(total_images, _TOTAL_THRESHOLDS.get(task_type, _DEFAULT_TOTAL_THRESHOLDS))
+
+    if task_type == "classification" and num_classes and num_classes > 0:
+        by_class = _tier(total_images / num_classes, _PER_CLASS_THRESHOLDS)
+        return min(by_total, by_class, key=_SIZE_ORDER.index)
+
+    return by_total
 
 
 _IMBALANCE_RATIO_THRESHOLD = 10
@@ -90,19 +121,28 @@ def merge_modules(m1_output: dict, m2_report: dict) -> dict:
     Module 3 的 retrieve_top3_hybrid() 所需的输入格式。
 
     Module 2 覆盖的字段：
-      - data_size：从 total_images 推断
+      - data_size：从 total_images + 类别数（分类任务）推断
+      - num_classes：来自 class_distribution，供 Module 4 生成正确的 head 维度
       - constraints.class_imbalance：从 class_distribution 推断（与 Module 1 取 OR）
     """
     merged = dict(m1_output)
     # constraints 单独拷贝，避免原地修改 m1_output 内层 dict
     merged["constraints"] = dict(m1_output.get("constraints", {}))
 
-    # data_size 由 Module 2 决定
+    class_dist = m2_report.get("class_distribution", {})
+    num_classes = len(class_dist) or None
+
+    # data_size 由 Module 2 决定：总量 + 每类样本数双信号
     total_images = m2_report.get("total_images", 0)
-    merged["data_size"] = derive_data_size(total_images)
+    merged["data_size"] = derive_data_size(
+        total_images,
+        num_classes=num_classes,
+        task_type=merged.get("task_type", "classification"),
+    )
+    if num_classes:
+        merged["num_classes"] = num_classes
 
     # class_imbalance: Module 1（用户说了）或 Module 2（数据显示了）任一为 True 即生效
-    class_dist = m2_report.get("class_distribution", {})
     m2_imbalance = derive_class_imbalance(class_dist)
     merged["constraints"]["class_imbalance"] = (
         merged["constraints"].get("class_imbalance", False) or m2_imbalance
@@ -212,6 +252,13 @@ def run_pipeline(
         module4_task_lists = task_lists
         if fmt != "nl":
             module4_task_lists = build_all_task_lists(recommendations, G, fmt="nl")
+        # 把 Module 2 探明的类别数注入 model_config，
+        # 否则 Module 4 会用默认 3 类生成 head
+        num_classes = m3_input.get("num_classes")
+        if num_classes:
+            for task_list in module4_task_lists:
+                if isinstance(task_list.get("model_config"), dict):
+                    task_list["model_config"].setdefault("num_classes", num_classes)
         module4_result = run_module4_generation(
             module4_task_lists,
             module4_output,

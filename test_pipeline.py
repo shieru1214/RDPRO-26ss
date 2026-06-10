@@ -65,6 +65,45 @@ class TestDeriveDataSize(unittest.TestCase):
     def test_zero(self):
         self.assertEqual(derive_data_size(0), "small")
 
+    # ── 双信号：每类样本数下调档位（过拟合侧）──────────────────────────
+
+    def test_per_class_downgrades_large_to_medium(self):
+        """25k 张 200 类 = 125 张/类：总量是 large，但有效样本量只有 medium"""
+        self.assertEqual(derive_data_size(25_000, num_classes=200), "medium")
+
+    def test_per_class_downgrades_medium_to_small(self):
+        """5k 张 100 类 = 50 张/类：每类样本太少，按 small 处理"""
+        self.assertEqual(derive_data_size(5_000, num_classes=100), "small")
+
+    # ── 双信号：总量上限不放行（成本侧）───────────────────────────────
+
+    def test_total_caps_high_per_class(self):
+        """3k 张 2 类 = 1500 张/类：每类充足，但总量决定成本，仍是 small"""
+        self.assertEqual(derive_data_size(3_000, num_classes=2), "small")
+
+    def test_both_signals_large(self):
+        """总量和每类样本数都够大才算 large"""
+        self.assertEqual(derive_data_size(100_000, num_classes=10), "large")
+
+    # ── 任务类型阈值：检测/分割标注成本高，阈值减半 ─────────────────────
+
+    def test_detection_thresholds_halved(self):
+        self.assertEqual(derive_data_size(1_500, task_type="object_detection"), "small")
+        self.assertEqual(derive_data_size(2_000, task_type="object_detection"), "medium")
+        self.assertEqual(derive_data_size(12_000, task_type="object_detection"), "large")
+
+    def test_segmentation_thresholds_halved(self):
+        self.assertEqual(derive_data_size(10_000, task_type="image_segmentation"), "medium")
+        self.assertEqual(derive_data_size(10_001, task_type="image_segmentation"), "large")
+
+    def test_per_class_ignored_for_detection(self):
+        """每类样本数信号仅用于分类任务"""
+        self.assertEqual(derive_data_size(12_000, num_classes=200, task_type="object_detection"), "large")
+
+    def test_no_num_classes_falls_back_to_total(self):
+        self.assertEqual(derive_data_size(25_000), "large")
+        self.assertEqual(derive_data_size(25_000, num_classes=None), "large")
+
 
 class TestDeriveClassImbalance(unittest.TestCase):
 
@@ -159,6 +198,34 @@ class TestMergeModules(unittest.TestCase):
         merged = merge_modules(m1, m2)
         self.assertTrue(merged["constraints"]["medical"])
         self.assertFalse(merged["constraints"]["cross_modal"])
+
+    def test_num_classes_passed_through(self):
+        """Module 2 的类别数应该出现在合并结果里，供 Module 4 使用"""
+        m1 = self._make_m1()
+        m2 = self._make_m2(class_dist={"a": 100, "b": 100, "c": 100})
+        merged = merge_modules(m1, m2)
+        self.assertEqual(merged["num_classes"], 3)
+
+    def test_num_classes_absent_when_no_distribution(self):
+        m1 = self._make_m1()
+        m2 = {"total_images": 5000, "class_distribution": {}}
+        merged = merge_modules(m1, m2)
+        self.assertNotIn("num_classes", merged)
+
+    def test_data_size_uses_per_class_signal(self):
+        """合并时 data_size 应考虑类别数：25k 张 200 类 → medium 而非 large"""
+        m1 = self._make_m1()
+        class_dist = {f"c{i}": 125 for i in range(200)}
+        m2 = self._make_m2(total_images=25_000, class_dist=class_dist)
+        merged = merge_modules(m1, m2)
+        self.assertEqual(merged["data_size"], "medium")
+
+    def test_merge_does_not_mutate_module1_output(self):
+        """merge 不应原地污染 Module 1 的输出"""
+        m1 = self._make_m1()
+        m2 = self._make_m2(class_dist={"a": 5000, "b": 10})
+        merge_modules(m1, m2)
+        self.assertFalse(m1["constraints"]["class_imbalance"])
 
 
 class TestModule4Handoff(unittest.TestCase):
