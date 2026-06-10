@@ -10,3 +10,6 @@ colab_demo_output/
 .tmp_e2e_test/
 chroma_db_kb/
 CLAUDE.local.md
+workspace/
+.DS_Store
+.pytest_cache/
