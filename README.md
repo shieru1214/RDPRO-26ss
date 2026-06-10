@@ -65,21 +65,6 @@ M4_LLM_PROVIDER=none
 Module 1 still needs an LLM provider for natural-language parsing. Module 4 can
 fall back to deterministic templates when its LLM provider is unavailable.
 
-## Retrieval Embeddings
-
-Module 3 uses a deterministic local embedding function by default, so retrieval
-tests and demos can run without downloading a HuggingFace sentence-transformer:
-
-```bash
-CV_AUTODL_EMBEDDINGS=local
-```
-
-To use the HuggingFace sentence-transformer embedding instead:
-
-```bash
-CV_AUTODL_EMBEDDINGS=hf
-```
-
 ## Run The Integrated Pipeline
 
 ```bash
