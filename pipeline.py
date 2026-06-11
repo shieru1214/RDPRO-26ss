@@ -130,7 +130,7 @@ def merge_modules(m1_output: dict, m2_report: dict) -> dict:
     merged["constraints"] = dict(m1_output.get("constraints", {}))
 
     class_dist = m2_report.get("class_distribution", {})
-    num_classes = len(class_dist) or None
+    num_classes = m2_report.get("num_classes") or len(class_dist) or None
 
     # data_size 由 Module 2 决定：总量 + 每类样本数双信号
     total_images = m2_report.get("total_images", 0)
