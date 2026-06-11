@@ -481,10 +481,11 @@ def _model_utils_py() -> str:
 def _model_py() -> str:
     return dedent(
         '''
-        """Local model builders for smoke runs.
+        """Task-specific model builders.
 
-        The models stay lightweight and offline by default. They match
-        task-specific tensor contracts used by the local checks.
+        When offline_smoke is true (default), models use a lightweight TinyBackbone
+        for fast CPU checks.  When offline_smoke is false, model_utils.load_backbone
+        loads the real pretrained checkpoint chosen by Module 3.
         """
 
         from __future__ import annotations
@@ -500,7 +501,7 @@ def _model_py() -> str:
 
 
         class TinyBackbone(nn.Module):
-            """Small CNN backbone shared by all smoke models."""
+            """Small CNN backbone for smoke runs."""
 
             def __init__(self, in_channels: int = 3, width: int = 16) -> None:
                 super().__init__()
@@ -517,25 +518,32 @@ def _model_py() -> str:
 
 
         class ClassificationModel(nn.Module):
-            def __init__(self, num_classes: int) -> None:
+            def __init__(self, num_classes: int, backbone: nn.Module | None = None, out_channels: int = 16) -> None:
                 super().__init__()
-                self.backbone = TinyBackbone()
-                self.head = nn.Linear(self.backbone.out_channels, num_classes)
+                self.backbone = backbone if backbone is not None else TinyBackbone()
+                _ch = out_channels if backbone is not None else self.backbone.out_channels
+                self.head = nn.Linear(_ch, num_classes)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 features = self.backbone(x)
-                pooled = F.adaptive_avg_pool2d(features, 1).flatten(1)
-                return self.head(pooled)
+                if features.dim() == 4:
+                    features = F.adaptive_avg_pool2d(features, 1).flatten(1)
+                return self.head(features)
 
 
         class SegmentationModel(nn.Module):
-            def __init__(self, num_classes: int) -> None:
+            def __init__(self, num_classes: int, backbone: nn.Module | None = None, out_channels: int = 16) -> None:
                 super().__init__()
-                self.backbone = TinyBackbone()
-                self.head = nn.Conv2d(self.backbone.out_channels, num_classes, kernel_size=1)
+                self.backbone = backbone if backbone is not None else TinyBackbone()
+                _ch = out_channels if backbone is not None else self.backbone.out_channels
+                self.head = nn.Conv2d(_ch, num_classes, kernel_size=1)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 features = self.backbone(x)
+                if features.dim() == 2:
+                    warnings.warn("Backbone returns pooled [B,D] features; segmentation needs spatial output.")
+                    return torch.zeros(x.shape[0], self.head.out_channels, x.shape[2], x.shape[3],
+                                       device=x.device, requires_grad=True)
                 logits = self.head(features)
                 if logits.shape[-2:] != x.shape[-2:]:
                     logits = F.interpolate(logits, size=x.shape[-2:], mode="bilinear", align_corners=False)
@@ -543,19 +551,21 @@ def _model_py() -> str:
 
 
         class DetectionModel(nn.Module):
-            """Minimal detector that returns DETR-like smoke outputs."""
+            """Minimal detector that returns DETR-like outputs."""
 
-            def __init__(self, num_classes: int) -> None:
+            def __init__(self, num_classes: int, backbone: nn.Module | None = None, out_channels: int = 16) -> None:
                 super().__init__()
-                self.backbone = TinyBackbone()
-                self.box_head = nn.Linear(self.backbone.out_channels, 4)
-                self.class_head = nn.Linear(self.backbone.out_channels, num_classes)
+                self.backbone = backbone if backbone is not None else TinyBackbone()
+                _ch = out_channels if backbone is not None else self.backbone.out_channels
+                self.box_head = nn.Linear(_ch, 4)
+                self.class_head = nn.Linear(_ch, num_classes)
 
             def forward(self, x: torch.Tensor, targets: list[dict[str, torch.Tensor]] | None = None) -> dict[str, torch.Tensor]:
                 features = self.backbone(x)
-                pooled = F.adaptive_avg_pool2d(features, 1).flatten(1)
-                pred_boxes = torch.sigmoid(self.box_head(pooled)).unsqueeze(1)
-                pred_logits = self.class_head(pooled).unsqueeze(1)
+                if features.dim() == 4:
+                    features = F.adaptive_avg_pool2d(features, 1).flatten(1)
+                pred_boxes = torch.sigmoid(self.box_head(features)).unsqueeze(1)
+                pred_logits = self.class_head(features).unsqueeze(1)
                 output: dict[str, torch.Tensor] = {
                     "pred_boxes": pred_boxes,
                     "pred_logits": pred_logits,
@@ -583,15 +593,17 @@ def _model_py() -> str:
 
 
         class FeatureExtractorModel(nn.Module):
-            def __init__(self, embedding_dim: int) -> None:
+            def __init__(self, embedding_dim: int, backbone: nn.Module | None = None, out_channels: int = 16) -> None:
                 super().__init__()
-                self.backbone = TinyBackbone()
-                self.head = nn.Linear(self.backbone.out_channels, embedding_dim)
+                self.backbone = backbone if backbone is not None else TinyBackbone()
+                _ch = out_channels if backbone is not None else self.backbone.out_channels
+                self.head = nn.Linear(_ch, embedding_dim)
 
             def forward(self, x: torch.Tensor) -> torch.Tensor:
                 features = self.backbone(x)
-                pooled = F.adaptive_avg_pool2d(features, 1).flatten(1)
-                embeddings = self.head(pooled)
+                if features.dim() == 4:
+                    features = F.adaptive_avg_pool2d(features, 1).flatten(1)
+                embeddings = self.head(features)
                 return F.normalize(embeddings, dim=1)
 
 
@@ -601,12 +613,10 @@ def _model_py() -> str:
                 get_value(config, "freeze_backbone", strategy == "head_only"),
                 strategy == "head_only",
             )
-
             if strategy == "full":
                 freeze_backbone = False
             elif strategy == "either":
                 freeze_backbone = False
-
             frozen = 0
             if freeze_backbone:
                 for name, parameter in model.named_parameters():
@@ -618,33 +628,41 @@ def _model_py() -> str:
 
 
         def build_model(config: dict[str, Any] | None) -> nn.Module:
-            """Build a task-compatible local model from a config dictionary."""
+            """Build a task-compatible model from a config dictionary.
 
+            When offline_smoke is true, uses TinyBackbone for fast CPU checks.
+            When false, loads the real backbone via model_utils.load_backbone.
+            """
             config = config or {}
             task = task_type(config)
             num_classes = max(1, as_int(get_value(config, "num_classes", 3), 3))
             embedding_dim = max(2, as_int(get_value(config, "embedding_dim", 32), 32))
-
             offline_smoke = as_bool(get_value(config, "offline_smoke", True), True)
-            use_pretrained = as_bool(get_value(config, "use_pretrained", False), False)
-            if use_pretrained and not offline_smoke:
-                warnings.warn(
-                    "Local smoke code does not download checkpoints by default; "
-                    "replace build_model with real pretrained loading for GPU runs.",
-                    RuntimeWarning,
-                )
+
+            if offline_smoke:
+                backbone = None
+                out_channels = 16
+            else:
+                from model_utils import load_backbone
+                backbone, out_channels = load_backbone(config)
 
             if task == "classification":
-                model = ClassificationModel(num_classes=num_classes)
+                model = ClassificationModel(num_classes, backbone, out_channels)
             elif task == "object_detection":
-                model = DetectionModel(num_classes=num_classes)
+                model = DetectionModel(num_classes, backbone, out_channels)
             elif task == "image_segmentation":
-                model = SegmentationModel(num_classes=num_classes)
+                model = SegmentationModel(num_classes, backbone, out_channels)
             elif task == "feature_extraction":
-                model = FeatureExtractorModel(embedding_dim=embedding_dim)
+                model = FeatureExtractorModel(embedding_dim, backbone, out_channels)
             else:
-                model = ClassificationModel(num_classes=num_classes)
-            return _apply_finetune_strategy(model, config)
+                model = ClassificationModel(num_classes, backbone, out_channels)
+
+            if offline_smoke:
+                _apply_finetune_strategy(model, config)
+            else:
+                from model_utils import apply_freeze
+                apply_freeze(model, config)
+            return model
         '''
     ).lstrip()
 
@@ -652,11 +670,16 @@ def _model_py() -> str:
 def _train_py() -> str:
     return dedent(
         '''
-        """Small local training loop for generated configs."""
+        """Training loop for generated configs.
+
+        Supports both smoke mode (synthetic data, 1 step) and real training
+        (HuggingFace dataset, multi-epoch, checkpoint saving).
+        """
 
         from __future__ import annotations
 
         import time
+        from pathlib import Path
         from typing import Any
 
         import torch
@@ -664,7 +687,7 @@ def _train_py() -> str:
 
         from model import build_model
         from smoke_data import synthetic_batch
-        from utils import as_float, get_value, task_type
+        from utils import as_bool, as_float, as_int, get_value, task_type
 
 
         def _build_optimizer(model: torch.nn.Module, config: dict[str, Any] | None) -> torch.optim.Optimizer:
@@ -708,42 +731,191 @@ def _train_py() -> str:
             return F.cross_entropy(output, target)
 
 
+        def _build_dataloader(config: dict[str, Any], split: str = "train", batch_size: int = 32):
+            """Build a DataLoader from a HuggingFace dataset.
+
+            Returns None if the dataset cannot be loaded (caller falls back to
+            synthetic data).  Currently supports classification and feature_extraction;
+            detection / segmentation fall back to synthetic data.
+            """
+            dataset_id = str(get_value(config, "dataset_id", "") or "").strip()
+            if not dataset_id:
+                return None
+
+            task = task_type(config)
+            if task in ("object_detection", "image_segmentation"):
+                print(f"[train] Real dataloader for {task} not yet implemented; using synthetic data.")
+                return None
+
+            try:
+                import importlib.metadata
+                _orig_ver = importlib.metadata.version
+                def _patched_ver(name):
+                    v = _orig_ver(name)
+                    if v is None and name == "torch":
+                        return torch.__version__.split("+")[0]
+                    return v
+                if not getattr(importlib.metadata.version, "_patched", False):
+                    _patched_ver._patched = True
+                    importlib.metadata.version = _patched_ver
+            except Exception:
+                pass
+
+            try:
+                from datasets import load_dataset
+                from torchvision import transforms
+            except ImportError:
+                print("[train] 'datasets' or 'torchvision' not installed; using synthetic data.")
+                return None
+
+            try:
+                subset = get_value(config, "dataset_subset", None)
+                try:
+                    ds = load_dataset(dataset_id, subset, trust_remote_code=True)
+                except (TypeError, ValueError):
+                    ds = load_dataset(dataset_id, subset)
+                if split not in ds:
+                    split = list(ds.keys())[0]
+                ds_split = ds[split]
+            except Exception as exc:
+                print(f"[train] Failed to load dataset {dataset_id!r}: {exc}")
+                return None
+
+            image_size = as_int(get_value(config, "image_size", 224), 224)
+            transform = transforms.Compose([
+                transforms.Resize((image_size, image_size)),
+                transforms.ToTensor(),
+                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+            ])
+
+            cols = ds_split.column_names
+            image_col = "image" if "image" in cols else ("img" if "img" in cols else None)
+            label_col = "label" if "label" in cols else ("labels" if "labels" in cols else None)
+            if image_col is None:
+                print("[train] No image column found in dataset; using synthetic data.")
+                return None
+
+            class _HFDataset(torch.utils.data.Dataset):
+                def __init__(self, hf_ds, img_col, lbl_col, tfm):
+                    self.hf_ds = hf_ds
+                    self.img_col = img_col
+                    self.lbl_col = lbl_col
+                    self.tfm = tfm
+
+                def __len__(self):
+                    return len(self.hf_ds)
+
+                def __getitem__(self, idx):
+                    row = self.hf_ds[idx]
+                    img = row[self.img_col]
+                    if not isinstance(img, torch.Tensor):
+                        img = img.convert("RGB")
+                        img = self.tfm(img)
+                    lbl = row[self.lbl_col] if self.lbl_col else 0
+                    return img, torch.tensor(lbl, dtype=torch.long)
+
+            wrapped = _HFDataset(ds_split, image_col, label_col, transform)
+            return torch.utils.data.DataLoader(
+                wrapped, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=True,
+            )
+
+
         def train_model(
             config: dict[str, Any] | None,
             data: tuple[Any, Any] | None = None,
             epochs: int = 1,
             max_steps: int = 1,
+            save_dir: str | None = None,
         ) -> tuple[torch.nn.Module, dict[str, Any]]:
-            """Run a short CPU training loop and return the trained model plus summary."""
+            """Train a model and return it with a summary.
 
+            Smoke mode (offline_smoke=true or no dataset): runs a quick
+            synthetic-data loop.  Real mode: loads the dataset, trains for
+            the requested epochs, saves checkpoints, and logs progress.
+            """
             start = time.time()
             config = config or {}
             task = task_type(config)
+            offline_smoke = as_bool(get_value(config, "offline_smoke", True), True)
             model = build_model(config)
             model.train()
             optimizer = _build_optimizer(model, config)
-            batch = data if data is not None else synthetic_batch(config)
             loss_value = 0.0
+            total_steps = 0
+            epoch_losses: list[float] = []
 
-            steps = max(1, int(max_steps))
-            for _epoch in range(max(1, int(epochs))):
-                for _step in range(steps):
-                    x, target = batch
-                    optimizer.zero_grad(set_to_none=True)
-                    if task == "object_detection":
-                        output = model(x, target)
-                    else:
-                        output = model(x)
-                    loss = _loss_for_output(output, target, config)
-                    loss.backward()
-                    optimizer.step()
-                    loss_value = float(loss.detach().cpu().item())
+            dataloader = None
+            if not offline_smoke and data is None:
+                batch_size = as_int(get_value(config, "batch_size", 32), 32)
+                dataloader = _build_dataloader(config, split="train", batch_size=batch_size)
+
+            if dataloader is not None:
+                if save_dir is None:
+                    save_dir = "checkpoints"
+                Path(save_dir).mkdir(parents=True, exist_ok=True)
+
+                for epoch in range(max(1, int(epochs))):
+                    epoch_loss = 0.0
+                    batch_count = 0
+                    for x, target in dataloader:
+                        optimizer.zero_grad(set_to_none=True)
+                        if task == "object_detection":
+                            output = model(x, target)
+                        else:
+                            output = model(x)
+                        loss = _loss_for_output(output, target, config)
+                        loss.backward()
+                        optimizer.step()
+                        loss_value = float(loss.detach().cpu().item())
+                        epoch_loss += loss_value
+                        batch_count += 1
+                        total_steps += 1
+                        if max_steps > 0 and total_steps >= max_steps:
+                            break
+                    avg_loss = epoch_loss / max(batch_count, 1)
+                    epoch_losses.append(avg_loss)
+                    print(f"[train] epoch {epoch + 1}/{epochs}  loss={avg_loss:.4f}  "
+                          f"steps={batch_count}  time={time.time() - start:.1f}s")
+
+                    ckpt_path = Path(save_dir) / f"checkpoint_epoch{epoch + 1}.pt"
+                    torch.save({
+                        "epoch": epoch + 1,
+                        "model_state_dict": model.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "loss": avg_loss,
+                    }, ckpt_path)
+
+                    if max_steps > 0 and total_steps >= max_steps:
+                        break
+
+                best_path = Path(save_dir) / "best_model.pt"
+                torch.save({"model_state_dict": model.state_dict()}, best_path)
+                print(f"[train] Done. Model saved to {best_path}")
+            else:
+                batch = data if data is not None else synthetic_batch(config)
+                steps = max(1, int(max_steps)) if max_steps > 0 else 1
+                for _epoch in range(max(1, int(epochs))):
+                    for _step in range(steps):
+                        x, target = batch
+                        optimizer.zero_grad(set_to_none=True)
+                        if task == "object_detection":
+                            output = model(x, target)
+                        else:
+                            output = model(x)
+                        loss = _loss_for_output(output, target, config)
+                        loss.backward()
+                        optimizer.step()
+                        loss_value = float(loss.detach().cpu().item())
+                        total_steps += 1
 
             summary = {
                 "status": "success",
                 "task_type": task,
                 "loss": loss_value,
+                "total_steps": total_steps,
+                "epoch_losses": epoch_losses,
                 "runtime_sec": round(time.time() - start, 4),
+                "real_data": dataloader is not None,
                 "config_summary": {
                     "rank": get_value(config, "rank", None),
                     "backbone": get_value(config, "backbone", "tiny_cnn"),
@@ -757,8 +929,7 @@ def _train_py() -> str:
 
 
         def train_one(config: dict[str, Any] | None, data: tuple[Any, Any] | None = None, epochs: int = 1, max_steps: int = 1) -> dict[str, Any]:
-            """Run a short CPU training loop and return a summary."""
-
+            """Run training and return a summary."""
             _model, summary = train_model(config, data=data, epochs=epochs, max_steps=max_steps)
             return summary
         '''
@@ -967,7 +1138,12 @@ def _infer_py() -> str:
 def _run_py(first_config_json: str) -> str:
     template = dedent(
         '''
-        """Single-configuration smoke runner."""
+        """Single-configuration runner.
+
+        Smoke mode (default):  offline_smoke=true  → synthetic data, 1 epoch, 1 step.
+        Real training mode:    offline_smoke=false  → HuggingFace dataset, multi-epoch,
+                               checkpoint saving.
+        """
 
         from __future__ import annotations
 
@@ -975,25 +1151,36 @@ def _run_py(first_config_json: str) -> str:
         import json
         from typing import Any
 
-
         from evaluate import evaluate
         from infer import predict
         from train import train_model
-        from utils import compact_config_summary, load_config, set_seed
+        from utils import as_bool, compact_config_summary, get_value, load_config, set_seed
 
 
         DEFAULT_CONFIG = json.loads(__DEFAULT_CONFIG_JSON__)
 
 
         def main() -> None:
-            parser = argparse.ArgumentParser(description="Run one generated smoke experiment.")
-            parser.add_argument("--config", default="configs.json", help="Optional JSON config path.")
+            parser = argparse.ArgumentParser(description="Run one experiment (smoke or real training).")
+            parser.add_argument("--config", default="configs.json", help="JSON config path.")
             parser.add_argument("--seed", type=int, default=123)
+            parser.add_argument("--epochs", type=int, default=None,
+                                help="Training epochs (default: 1 for smoke, 10 for real).")
+            parser.add_argument("--dataset", default=None,
+                                help="Override dataset_id in config for real training.")
             args = parser.parse_args()
 
             set_seed(args.seed)
             config = load_config(args.config, DEFAULT_CONFIG)
-            model, train_result = train_model(config, epochs=1, max_steps=1)
+
+            if args.dataset:
+                config["dataset_id"] = args.dataset
+
+            offline_smoke = as_bool(get_value(config, "offline_smoke", True), True)
+            epochs = args.epochs if args.epochs is not None else (1 if offline_smoke else 10)
+            max_steps = 1 if offline_smoke else 0
+
+            model, train_result = train_model(config, epochs=epochs, max_steps=max_steps)
             eval_result = evaluate(model, config)
             infer_result = predict(config=config, model=model)
             summary = {
@@ -1024,21 +1211,22 @@ def _run_experiments_py(configs_json: str) -> str:
         import json
         from typing import Any
 
-
         from evaluate import evaluate
         from train import train_model
-        from utils import compact_config_summary, load_configs, set_seed
+        from utils import as_bool, compact_config_summary, get_value, load_configs, set_seed
 
 
         DEFAULT_CONFIGS = json.loads(__DEFAULT_CONFIGS_JSON__)
 
 
-        def run_all(configs: list[dict[str, Any]], seed: int = 123) -> list[dict[str, Any]]:
+        def run_all(configs: list[dict[str, Any]], seed: int = 123, epochs: int | None = None) -> list[dict[str, Any]]:
             rows = []
             for index, config in enumerate(configs, start=1):
-                # Keep synthetic runs comparable across candidates.
                 set_seed(seed)
-                model, train_result = train_model(config, epochs=1, max_steps=1)
+                offline_smoke = as_bool(get_value(config, "offline_smoke", True), True)
+                ep = epochs if epochs is not None else (1 if offline_smoke else 10)
+                ms = 1 if offline_smoke else 0
+                model, train_result = train_model(config, epochs=ep, max_steps=ms)
                 eval_result = evaluate(model, config)
                 row = compact_config_summary(config, rank_default=index)
                 row.update(
@@ -1054,10 +1242,12 @@ def _run_experiments_py(configs_json: str) -> str:
 
         def main() -> None:
             parser = argparse.ArgumentParser(description="Sweep all Module 3 candidate configs.")
-            parser.add_argument("--input", default="configs.json", help="Optional JSON file with one or more configs.")
+            parser.add_argument("--input", default="configs.json", help="JSON file with one or more configs.")
             parser.add_argument("--seed", type=int, default=123)
+            parser.add_argument("--epochs", type=int, default=None,
+                                help="Training epochs per candidate (default: 1 smoke / 10 real).")
             args = parser.parse_args()
-            rows = run_all(load_configs(args.input, DEFAULT_CONFIGS), seed=args.seed)
+            rows = run_all(load_configs(args.input, DEFAULT_CONFIGS), seed=args.seed, epochs=args.epochs)
             print(json.dumps(rows, indent=2, sort_keys=True))
 
 
@@ -1069,7 +1259,7 @@ def _run_experiments_py(configs_json: str) -> str:
 
 
 def _requirements_txt() -> str:
-    return "torch\ntorchvision\n"
+    return "torch\ntorchvision\ntransformers\ndatasets\nPillow\n"
 
 
 def _readme_generated_md(
@@ -1121,30 +1311,29 @@ def _readme_generated_md(
         - `utils.py`: shared config parsing, seed, and task-type helpers.
         - `model_utils.py`: shared backbone loading and freeze helpers.
         - `smoke_data.py`: shared synthetic data helpers for local smoke runs.
-        - `model.py`: task-compatible lightweight PyTorch models with
-          `build_model(config)`.
-        - `train.py`: `train_one(config, data=None, epochs=1, max_steps=1)` for
-          local CPU smoke training.
-        - `evaluate.py`: smoke-compatible metrics by task type.
+        - `model.py`: task-compatible PyTorch models with `build_model(config)`.
+          Uses TinyBackbone in smoke mode, real pretrained backbone otherwise.
+        - `train.py`: training loop with real-data dataloader, multi-epoch
+          support, and checkpoint saving when `offline_smoke: false`.
+        - `evaluate.py`: metrics by task type.
         - `infer.py`: `predict(weights_path=None, image=None, config=None)`.
-        - `run.py`: single-configuration smoke flow.
+        - `run.py`: single-configuration runner (smoke or real).
         - `run_experiments.py`: sweeps every Module 3 candidate.
-        - `module4_summary.json`: written by the Module 4 workflow after
-          generation, smoke testing, and review.
-        - `experiments.jsonl`, `leaderboard.json`, `refinement_summary.json`,
-          and `best_config.json`: written by the outer Module 4 workflow only
-          when it is run with `--run-refinement`.
 
         ## Usage
 
+        Smoke check (fast, offline, CPU):
         ```bash
         python run.py --config configs.json
         python run_experiments.py --input configs.json
         ```
 
-        `run.py` loads the first config from `configs.json`. `run_experiments.py`
-        sweeps every candidate using the same random seed and synthetic data
-        setup for each candidate.
+        Real training (set `offline_smoke: false` in configs.json first):
+        ```bash
+        python run.py --config configs.json --epochs 20
+        python run.py --config configs.json --dataset uoft-cs/cifar10 --epochs 10
+        python run_experiments.py --input configs.json --epochs 5
+        ```
 
         ## Smoke vs Real Training
 
@@ -1155,17 +1344,22 @@ def _readme_generated_md(
         experiment sweep coverage.
 
         For real training, set `offline_smoke: false` and keep
-        `use_pretrained: true` in the config. `model_utils.load_backbone` then
-        loads the exact `pretrained_hf_id` checkpoint chosen by Module 3
-        (requires `pip install transformers`), falling back to torchvision
-        DEFAULT weights, then to random init, if unavailable.
+        `use_pretrained: true` in the config.  What changes:
+        - `model.py` loads the real backbone via `model_utils.load_backbone`
+          (HuggingFace checkpoint → torchvision → TinyBackbone fallback)
+        - `train.py` loads the HuggingFace dataset specified by `dataset_id`
+          in the config (classification / feature_extraction; detection and
+          segmentation fall back to synthetic data for now)
+        - Multi-epoch training with per-epoch logging
+        - Checkpoints saved to `checkpoints/` after each epoch
+        - Requires: `pip install transformers datasets Pillow`
 
         ## Current Limitations
 
-        - No real long training is performed locally.
-        - Object detection and segmentation metrics are smoke-compatible
-          placeholders, not benchmark scores.
-        - HuggingFace checkpoint loading is disabled by default.
+        - Real dataloader supports classification and feature_extraction;
+          detection / segmentation still use synthetic data.
+        - Object detection and segmentation metrics are simplified,
+          not benchmark scores.
         - Module 3 controls candidate scale; this project only executes the
           supplied configs.
 

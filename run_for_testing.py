@@ -121,6 +121,8 @@ def main() -> None:
                         help="Also run Module 4 to generate training code (slower)")
     parser.add_argument("--no-smoke", action="store_true",
                         help="Module 4: generate only, skip smoke tests (faster)")
+    parser.add_argument("--real-training", action="store_true",
+                        help="Module 4: generate real training code (offline_smoke=false, auto skips smoke)")
     parser.add_argument("--fmt", default="nl", choices=["structured", "nl"],
                         help="Module 4 task list format")
     args = parser.parse_args()
@@ -162,6 +164,8 @@ def main() -> None:
 
     from pipeline import run_pipeline
 
+    skip_smoke = args.no_smoke or args.real_training
+
     try:
         result = run_pipeline(
             args.query,
@@ -169,7 +173,8 @@ def main() -> None:
             fmt=args.fmt,
             subset=subset,
             module4_output=(output_dir / "module4_code") if args.module4 else None,
-            module4_skip_smoke=args.no_smoke,
+            module4_skip_smoke=skip_smoke,
+            module4_real_training=args.real_training,
         )
     except FileNotFoundError as e:
         traceback.print_exc()

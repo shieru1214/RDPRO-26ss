@@ -131,6 +131,9 @@ def test_reviewer_dynamically_rejects_broken_head_only_freeze(tmp_path):
     generated.files["model.py"] = generated.files["model.py"].replace(
         "parameter.requires_grad = False",
         "parameter.requires_grad = True",
+    ).replace(
+        "apply_freeze",
+        "_no_freeze",
     )
     write_generated_files(generated, tmp_path)
     smoke = SmokeResult(

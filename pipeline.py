@@ -210,6 +210,7 @@ def run_pipeline(
     module4_run_refinement: bool = False,
     module4_timeout: int = 60,
     module4_llm_provider: str | None = None,
+    module4_real_training: bool = False,
 ) -> dict:
     """
     完整流水线入口。
@@ -262,13 +263,17 @@ def run_pipeline(
         module4_task_lists = task_lists
         if fmt != "nl":
             module4_task_lists = build_all_task_lists(recommendations, G, fmt="nl")
-        # 把 Module 2 探明的类别数注入 model_config，
-        # 否则 Module 4 会用默认 3 类生成 head
         num_classes = m3_input.get("num_classes")
-        if num_classes:
-            for task_list in module4_task_lists:
-                if isinstance(task_list.get("model_config"), dict):
-                    task_list["model_config"].setdefault("num_classes", num_classes)
+        for task_list in module4_task_lists:
+            mc = task_list.get("model_config")
+            if isinstance(mc, dict):
+                if num_classes:
+                    mc.setdefault("num_classes", num_classes)
+                mc.setdefault("dataset_id", dataset_id)
+                if subset:
+                    mc.setdefault("dataset_subset", subset)
+                if module4_real_training:
+                    mc["offline_smoke"] = False
         module4_result = run_module4_generation(
             module4_task_lists,
             module4_output,

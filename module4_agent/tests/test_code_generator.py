@@ -70,7 +70,8 @@ def test_run_uses_trained_model_for_evaluation():
 
     assert "model, train_result = train_model" in generated.files["run.py"]
     assert "eval_result = evaluate(model, config)" in generated.files["run.py"]
-    assert "break" not in generated.files["train.py"]
+    assert "def _build_dataloader" in generated.files["train.py"]
+    assert "torch.save" in generated.files["train.py"]
 
 
 def test_feedback_is_embedded_into_generated_readme():
@@ -90,7 +91,6 @@ def test_generated_readme_documents_runtime_files():
     assert "model_utils.py" in readme
     assert "smoke_data.py" in readme
     assert "M4_LLM_PROVIDER=qwen" in readme
-    assert "module4_summary.json" in readme
-    assert "best_config.json" in readme
     assert "Smoke vs Real Training" in readme
     assert "Current Limitations" in readme
+    assert "checkpoint" in readme.lower()
