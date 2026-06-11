@@ -948,7 +948,7 @@ def _evaluate_py() -> str:
         import torch
 
         from smoke_data import synthetic_batch
-        from utils import as_int, get_value, task_type
+        from utils import as_bool, as_int, get_value, task_type
 
 
         def _macro_f1(preds: torch.Tensor, labels: torch.Tensor, num_classes: int) -> float:
@@ -1002,34 +1002,119 @@ def _evaluate_py() -> str:
             return inter / union
 
 
+        def _count_params(model: torch.nn.Module) -> dict[str, int]:
+            total = sum(p.numel() for p in model.parameters())
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            return {"total": total, "trainable": trainable}
+
+
+        def _eval_classification_batch(model: torch.nn.Module, x: torch.Tensor, target: torch.Tensor):
+            output = model(x)
+            preds = output.argmax(dim=1)
+            return preds, target
+
+
+        def _eval_on_dataloader(model: torch.nn.Module, dataloader, config: dict[str, Any]) -> dict[str, Any]:
+            """Evaluate on a full DataLoader (real data path)."""
+            task = task_type(config)
+            num_classes = max(1, as_int(get_value(config, "num_classes", 3), 3))
+            model.eval()
+
+            all_preds: list[torch.Tensor] = []
+            all_labels: list[torch.Tensor] = []
+            with torch.no_grad():
+                for x, target in dataloader:
+                    if task == "classification":
+                        preds, labels = _eval_classification_batch(model, x, target)
+                        all_preds.append(preds)
+                        all_labels.append(labels)
+                    elif task == "feature_extraction":
+                        output = model(x)
+                        all_preds.append(output)
+                        all_labels.append(target)
+                    else:
+                        output = model(x)
+                        all_preds.append(output.argmax(dim=1) if output.dim() > 1 else output)
+                        all_labels.append(target)
+
+            if task == "classification":
+                preds = torch.cat(all_preds)
+                labels = torch.cat(all_labels)
+                accuracy = float((preds == labels).float().mean().item())
+                return {
+                    "metric_name": "accuracy",
+                    "metric_value": accuracy,
+                    "macro_f1": _macro_f1(preds, labels, num_classes),
+                    "num_samples": len(labels),
+                    "params": _count_params(model),
+                    "status": "success",
+                }
+            if task == "feature_extraction":
+                embeddings = torch.cat(all_preds)
+                labels = torch.cat(all_labels)
+                distances = torch.cdist(embeddings, embeddings)
+                distances.fill_diagonal_(float("inf"))
+                nearest = distances.argmin(dim=1)
+                recall = float((labels[nearest] == labels).float().mean().item())
+                return {
+                    "metric_name": "recall@1",
+                    "metric_value": recall,
+                    "num_samples": len(labels),
+                    "params": _count_params(model),
+                    "status": "success",
+                }
+            preds = torch.cat(all_preds)
+            labels = torch.cat(all_labels)
+            accuracy = float((preds == labels).float().mean().item())
+            return {
+                "metric_name": "accuracy",
+                "metric_value": accuracy,
+                "num_samples": len(labels),
+                "params": _count_params(model),
+                "status": "success",
+            }
+
+
         def evaluate(model: torch.nn.Module, config: dict[str, Any] | None, data: tuple[Any, Any] | None = None) -> dict[str, Any]:
-            """Evaluate a model with synthetic data when data is not provided."""
+            """Evaluate a model.  Uses real test data when offline_smoke is false."""
 
             config = config or {}
             task = task_type(config)
             num_classes = max(1, as_int(get_value(config, "num_classes", 3), 3))
+            offline_smoke = as_bool(get_value(config, "offline_smoke", True), True)
+
+            if not offline_smoke and data is None:
+                from train import _build_dataloader
+                dataloader = _build_dataloader(config, split="test", batch_size=64)
+                if dataloader is not None:
+                    return _eval_on_dataloader(model, dataloader, config)
+
             x, target = data if data is not None else synthetic_batch(config)
             model.eval()
             with torch.no_grad():
                 output = model(x)
 
+            result: dict[str, Any] = {"params": _count_params(model)}
+
             if task == "classification":
                 preds = output.argmax(dim=1)
                 accuracy = float((preds == target).float().mean().item())
-                return {
+                result.update({
                     "metric_name": "accuracy",
                     "metric_value": accuracy,
                     "macro_f1": _macro_f1(preds, target, num_classes),
                     "status": "success",
-                }
+                })
+                return result
             if task == "image_segmentation":
                 preds = output.argmax(dim=1)
-                return {
+                result.update({
                     "metric_name": "mIoU",
                     "metric_value": _mean_iou(preds, target, num_classes),
                     "dice": _dice(preds, target, num_classes),
                     "status": "success",
-                }
+                })
+                return result
             if task == "object_detection":
                 pred_boxes = output["pred_boxes"][:, 0, :]
                 pred_logits = output["pred_logits"][:, 0, :]
@@ -1041,23 +1126,26 @@ def _evaluate_py() -> str:
                     class_hit = int(pred_classes[idx].item()) == int(label.item())
                     box_hit = float(_box_iou(pred_boxes[idx].cpu(), box.cpu()).item()) >= 0.5
                     hits.append(1.0 if class_hit and box_hit else 0.0)
-                return {
+                result.update({
                     "metric_name": "mAP@0.5",
                     "metric_value": float(sum(hits) / len(hits)) if hits else 0.0,
                     "status": "success",
-                }
+                })
+                return result
             if task == "feature_extraction":
                 embeddings = output
                 distances = torch.cdist(embeddings, embeddings)
                 distances.fill_diagonal_(float("inf"))
                 nearest = distances.argmin(dim=1)
                 recall = float((target[nearest] == target).float().mean().item())
-                return {
+                result.update({
                     "metric_name": "recall@1",
                     "metric_value": recall,
                     "status": "success",
-                }
-            return {"metric_name": "accuracy", "metric_value": 0.0, "status": "success"}
+                })
+                return result
+            result.update({"metric_name": "accuracy", "metric_value": 0.0, "status": "success"})
+            return result
         '''
     ).lstrip()
 
