@@ -1242,7 +1242,7 @@ def _run_py(first_config_json: str) -> str:
         from evaluate import evaluate
         from infer import predict
         from train import train_model
-        from utils import as_bool, compact_config_summary, get_value, load_config, set_seed
+        from utils import as_bool, as_int, compact_config_summary, get_value, load_config, set_seed
 
 
         DEFAULT_CONFIG = json.loads(__DEFAULT_CONFIG_JSON__)
@@ -1265,7 +1265,8 @@ def _run_py(first_config_json: str) -> str:
                 config["dataset_id"] = args.dataset
 
             offline_smoke = as_bool(get_value(config, "offline_smoke", True), True)
-            epochs = args.epochs if args.epochs is not None else (1 if offline_smoke else 10)
+            default_epochs = 1 if offline_smoke else as_int(get_value(config, "recommended_epochs", 10), 10)
+            epochs = args.epochs if args.epochs is not None else default_epochs
             max_steps = 1 if offline_smoke else 0
 
             model, train_result = train_model(config, epochs=epochs, max_steps=max_steps)
@@ -1301,7 +1302,7 @@ def _run_experiments_py(configs_json: str) -> str:
 
         from evaluate import evaluate
         from train import train_model
-        from utils import as_bool, compact_config_summary, get_value, load_configs, set_seed
+        from utils import as_bool, as_int, compact_config_summary, get_value, load_configs, set_seed
 
 
         DEFAULT_CONFIGS = json.loads(__DEFAULT_CONFIGS_JSON__)
@@ -1312,7 +1313,8 @@ def _run_experiments_py(configs_json: str) -> str:
             for index, config in enumerate(configs, start=1):
                 set_seed(seed)
                 offline_smoke = as_bool(get_value(config, "offline_smoke", True), True)
-                ep = epochs if epochs is not None else (1 if offline_smoke else 10)
+                default_ep = 1 if offline_smoke else as_int(get_value(config, "recommended_epochs", 10), 10)
+                ep = epochs if epochs is not None else default_ep
                 ms = 1 if offline_smoke else 0
                 model, train_result = train_model(config, epochs=ep, max_steps=ms)
                 eval_result = evaluate(model, config)

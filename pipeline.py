@@ -67,6 +67,34 @@ def derive_data_size(
     return by_total
 
 
+_RECOMMENDED_EPOCHS = {
+    ("small",  "head_only"): 25,
+    ("small",  "finetune"):  40,
+    ("small",  "scratch"):   50,
+    ("medium", "head_only"): 12,
+    ("medium", "finetune"):  20,
+    ("medium", "scratch"):   30,
+    ("large",  "head_only"):  8,
+    ("large",  "finetune"):  15,
+    ("large",  "scratch"):   20,
+}
+
+
+def derive_recommended_epochs(
+    data_size: str,
+    finetune_strategy: str | None,
+    use_pretrained: bool,
+) -> int:
+    """Recommend training epochs based on data size and training mode."""
+    if not use_pretrained:
+        mode = "scratch"
+    elif finetune_strategy == "head_only":
+        mode = "head_only"
+    else:
+        mode = "finetune"
+    return _RECOMMENDED_EPOCHS.get((data_size, mode), 15)
+
+
 _IMBALANCE_RATIO_THRESHOLD = 10
 
 def derive_class_imbalance(class_distribution: dict) -> bool:
@@ -272,6 +300,11 @@ def run_pipeline(
                 mc.setdefault("dataset_id", dataset_id)
                 if subset:
                     mc.setdefault("dataset_subset", subset)
+                mc.setdefault("recommended_epochs", derive_recommended_epochs(
+                    m3_input.get("data_size", "medium"),
+                    mc.get("finetune_strategy"),
+                    bool(mc.get("pretrained_hf_id")),
+                ))
                 if module4_real_training:
                     mc["offline_smoke"] = False
         module4_result = run_module4_generation(
