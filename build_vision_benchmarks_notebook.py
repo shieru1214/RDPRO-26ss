@@ -250,6 +250,7 @@ os.environ["OPENAI_BASE_URL"] = (
 )
 os.environ["M4_LLM_PROVIDER"] = "openai"
 os.environ["M4_OPENAI_MODEL"] = "gpt-5.5"
+os.environ["M4_OPENAI_WIRE_API"] = "responses"
 
 if benchmark["source"] == "kaggle":
     kaggle_token = read_secret("KAGGLE_API_TOKEN", required=True)
@@ -266,6 +267,7 @@ if benchmark["source"] == "kaggle":
 del openai_api_key
 print("LLM provider: openai")
 print("Configured model: gpt-5.5")
+print("Wire API: responses")
 print("Custom OpenAI-compatible endpoint configured:", bool(os.environ.get("OPENAI_BASE_URL")))
 print("Kaggle token configured:", bool(os.environ.get("KAGGLE_API_TOKEN")))
 """
@@ -376,8 +378,9 @@ print(json.dumps(runtime_data, indent=2, ensure_ascii=False))
         """
 ## 使用 GPT-5.5 生成训练项目
 
-这一步直接调用 Module 4。生成后会检查 `generation_info.json`：
-若 API 调用失败并回退到模板，单元格会明确报错，不会假装 GPT-5.5 已经参与。
+这一步直接调用 Module 4，并使用代理配置要求的 Responses API。
+生成后会检查 `generation_info.json`。如果代理返回 HTML、登录页或无效 Python，
+系统会记录失败原因并自动使用经过 smoke test 的模板继续训练，不会把无效内容写进 `model.py`。
 """
     ),
     code(
@@ -431,10 +434,11 @@ generation_info = json.loads(generation_info_path.read_text(encoding="utf-8"))
 print(json.dumps(generation_info, indent=2, ensure_ascii=False))
 
 if not generation_info.get("llm_used"):
-    raise RuntimeError(
-        "GPT code generation was not used. The API call fell back to the template. "
-        "Check OPENAI_API_KEY, OPENAI_BASE_URL, and whether the endpoint provides gpt-5.5."
+    print(
+        "\nWARNING: GPT-5.5 was attempted but did not return valid Python. "
+        "Training will continue with the validated template model.py."
     )
+    print("Fallback reason:", generation_info.get("fallback_reason") or "unknown")
 if generation_info.get("llm_model") != "gpt-5.5":
     raise RuntimeError(f"Unexpected generation model: {generation_info.get('llm_model')!r}")
 

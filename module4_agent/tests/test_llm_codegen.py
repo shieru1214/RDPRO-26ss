@@ -2,7 +2,14 @@ import sys
 from types import ModuleType
 from types import SimpleNamespace
 
-from module4_agent.llm_codegen import _call_openai, _response_text
+from module4_agent.llm_codegen import (
+    _call_openai,
+    _normalize_openai_base_url,
+    _response_text,
+    generate_model_py,
+    get_last_generation_error,
+)
+from module4_agent.schemas import TrainingSpec
 
 
 def test_response_text_accepts_direct_string():
@@ -66,7 +73,7 @@ def test_call_openai_accepts_direct_string_from_compatible_endpoint(monkeypatch)
     monkeypatch.delenv("M4_OPENAI_WIRE_API", raising=False)
 
     assert _call_openai("system", "user") == "print('direct')"
-    assert calls["client"]["base_url"] == "https://example.test"
+    assert calls["client"]["base_url"] == "https://example.test/v1"
     assert calls["request"]["model"] == "gpt-5.5"
 
 
@@ -95,3 +102,47 @@ def test_call_openai_supports_responses_wire_api(monkeypatch):
         "instructions": "system",
         "input": "user",
     }
+
+
+def test_responses_wire_keeps_gateway_root():
+    assert (
+        _normalize_openai_base_url("https://yybb.codes", "responses")
+        == "https://yybb.codes"
+    )
+
+
+def test_generate_model_rejects_html(monkeypatch):
+    monkeypatch.setattr(
+        "module4_agent.llm_codegen._call_llm",
+        lambda *_args, **_kwargs: "<!doctype html><html><body>Login</body></html>",
+    )
+
+    assert generate_model_py(TrainingSpec(), provider="openai") is None
+    assert "HTML" in get_last_generation_error()
+
+
+def test_generate_model_rejects_invalid_python(monkeypatch):
+    monkeypatch.setattr(
+        "module4_agent.llm_codegen._call_llm",
+        lambda *_args, **_kwargs: "this is not valid python",
+    )
+
+    assert generate_model_py(TrainingSpec(), provider="openai") is None
+    assert "invalid Python" in get_last_generation_error()
+
+
+def test_generate_model_accepts_valid_build_model(monkeypatch):
+    monkeypatch.setattr(
+        "module4_agent.llm_codegen._call_llm",
+        lambda *_args, **_kwargs: (
+            "from torch import nn\n"
+            "def build_model(config: dict) -> nn.Module:\n"
+            "    return nn.Identity()\n"
+        ),
+    )
+
+    generated = generate_model_py(TrainingSpec(), provider="openai")
+
+    assert generated is not None
+    assert "def build_model" in generated
+    assert get_last_generation_error() == ""

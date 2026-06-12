@@ -7,7 +7,7 @@ import os
 from collections.abc import Sequence
 from textwrap import dedent
 
-from .llm_codegen import generate_model_py, get_provider
+from .llm_codegen import generate_model_py, get_last_generation_error, get_provider
 from .schemas import GeneratedFiles, TrainingSpec
 from .spec_builder import specs_to_configs
 
@@ -49,10 +49,16 @@ def generate_files(
     # LLM 只生成 model.py（使用 model_utils helper），train/evaluate 始终用模板
     llm_model = generate_model_py(specs[0], feedback=feedback or "", provider=provider)
     model_source = provider if llm_model else "template"
+    fallback_reason = get_last_generation_error() if not llm_model and provider != "none" else ""
 
     files = {
         "configs.json": configs_json + "\n",
-        "generation_info.json": _generation_info_json(provider, model_source, llm_model is not None),
+        "generation_info.json": _generation_info_json(
+            provider,
+            model_source,
+            llm_model is not None,
+            fallback_reason=fallback_reason,
+        ),
         "utils.py": _utils_py(),
         "model_utils.py": _model_utils_py(),
         "smoke_data.py": _smoke_data_py(),
@@ -68,7 +74,13 @@ def generate_files(
     return GeneratedFiles(files=files)
 
 
-def _generation_info_json(provider: str, model_source: str, llm_used: bool) -> str:
+def _generation_info_json(
+    provider: str,
+    model_source: str,
+    llm_used: bool,
+    *,
+    fallback_reason: str = "",
+) -> str:
     model_name = ""
     if provider == "openai":
         model_name = os.environ.get("M4_OPENAI_MODEL", "gpt-4o")
@@ -80,8 +92,10 @@ def _generation_info_json(provider: str, model_source: str, llm_used: bool) -> s
         "model_py_source": model_source,
         "llm_provider": provider,
         "llm_model": model_name,
+        "llm_attempted": provider != "none",
         "llm_used": llm_used,
         "template_fallback": not llm_used,
+        "fallback_reason": fallback_reason,
         "generated_by": "module4_agent",
     }
     return json.dumps(info, indent=2, sort_keys=True) + "\n"

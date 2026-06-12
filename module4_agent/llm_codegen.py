@@ -10,14 +10,30 @@ LLM 代码生成层 — 通过环境变量切换 provider。
 
 from __future__ import annotations
 
+import ast
 import json
 import os
 import re
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from env_loader import load_env_file
 
 from .schemas import TrainingSpec
+
+
+_LAST_GENERATION_ERROR = ""
+
+
+def _set_generation_error(message: str) -> None:
+    global _LAST_GENERATION_ERROR
+    _LAST_GENERATION_ERROR = message.strip()
+
+
+def get_last_generation_error() -> str:
+    """Return the latest provider or generated-code validation failure."""
+
+    return _LAST_GENERATION_ERROR
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -157,11 +173,11 @@ def _call_openai(system_prompt: str, user_prompt: str) -> str | None:
         from openai import OpenAI
         client_kwargs = {"api_key": os.environ["OPENAI_API_KEY"]}
         base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
+        wire_api = os.environ.get("M4_OPENAI_WIRE_API", "chat_completions").strip().lower()
         if base_url:
-            client_kwargs["base_url"] = base_url
+            client_kwargs["base_url"] = _normalize_openai_base_url(base_url, wire_api)
         client = OpenAI(**client_kwargs)
         model = os.environ.get("M4_OPENAI_MODEL", "gpt-4o")
-        wire_api = os.environ.get("M4_OPENAI_WIRE_API", "chat_completions").strip().lower()
         if wire_api in {"responses", "response"}:
             resp = client.responses.create(
                 model=model,
@@ -182,8 +198,30 @@ def _call_openai(system_prompt: str, user_prompt: str) -> str | None:
             raise ValueError(f"Unsupported empty response type: {type(resp).__name__}")
         return text
     except Exception as e:
-        print(f"[LLM] OpenAI call failed: {e}")
+        _set_generation_error(f"OpenAI call failed: {e}")
+        print(f"[LLM] {_LAST_GENERATION_ERROR}")
         return None
+
+
+def _normalize_openai_base_url(base_url: str, wire_api: str) -> str:
+    """Normalize custom endpoints for the OpenAI SDK.
+
+    Responses-compatible gateways such as Codex providers commonly expose
+    ``/responses`` at their configured root. Chat Completions gateways usually
+    expose ``/v1/chat/completions``, so a bare origin receives ``/v1``.
+    """
+
+    cleaned = base_url.strip().rstrip("/")
+    parsed = urlsplit(cleaned)
+    if (
+        wire_api not in {"responses", "response"}
+        and parsed.scheme in {"http", "https"}
+        and parsed.netloc
+        and parsed.path in {"", "/"}
+    ):
+        parsed = parsed._replace(path="/v1")
+        return urlunsplit(parsed)
+    return cleaned
 
 
 def _call_vertex(system_prompt: str, user_prompt: str) -> str | None:
@@ -217,6 +255,36 @@ def _extract_python(raw: str) -> str:
     # 没有 markdown 包裹，去除可能的 ``` 行
     cleaned = re.sub(r"```\w*\s*", "", raw).strip().rstrip("`")
     return cleaned
+
+
+def _validate_model_python(source: str) -> str | None:
+    """Return a reason when provider output is not a usable model.py."""
+
+    stripped = source.lstrip()
+    lowered = stripped[:500].lower()
+    if any(
+        marker in lowered
+        for marker in (
+            "<!doctype html",
+            "<html",
+            "<head",
+            "<body",
+            "access denied",
+            "cloudflare",
+        )
+    ):
+        return "provider returned an HTML or gateway error page instead of Python"
+    try:
+        tree = ast.parse(source, filename="model.py")
+    except SyntaxError as exc:
+        return f"provider returned invalid Python: {exc}"
+    if not any(
+        isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        and node.name == "build_model"
+        for node in ast.walk(tree)
+    ):
+        return "provider output does not define required build_model(config)"
+    return None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -277,6 +345,7 @@ CRITICAL — forward() return types (the template train.py and evaluate.py depen
 
 def generate_model_py(spec: TrainingSpec, feedback: str = "", provider: str | None = None) -> str | None:
     """用 LLM 生成 model.py（使用 model_utils helper）。失败返回 None。"""
+    _set_generation_error("")
     prompt = _MODEL_PY_PROMPT.format(
         task_type=spec.task_type,
         backbone=spec.backbone,
@@ -285,4 +354,14 @@ def generate_model_py(spec: TrainingSpec, feedback: str = "", provider: str | No
     if feedback:
         prompt += f"\n\nPrevious attempt failed with this feedback:\n{feedback}\nFix the issues."
     raw = _call_llm(_SYSTEM_PROMPT, prompt, provider=provider)
-    return _extract_python(raw) if raw else None
+    if not raw:
+        if not get_last_generation_error():
+            _set_generation_error("provider returned no content")
+        return None
+    source = _extract_python(raw)
+    invalid_reason = _validate_model_python(source)
+    if invalid_reason:
+        _set_generation_error(invalid_reason)
+        print(f"[LLM] Rejected provider output: {invalid_reason}. Using template fallback.")
+        return None
+    return source

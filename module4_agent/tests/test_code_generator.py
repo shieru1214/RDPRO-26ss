@@ -49,9 +49,31 @@ def test_generation_info_defaults_to_template(monkeypatch):
 
     assert info["llm_provider"] == "none"
     assert info["llm_model"] == ""
+    assert info["llm_attempted"] is False
     assert info["model_py_source"] == "template"
     assert info["llm_used"] is False
     assert info["template_fallback"] is True
+    assert info["fallback_reason"] == ""
+
+
+def test_invalid_llm_output_falls_back_to_compiling_template(monkeypatch):
+    monkeypatch.setattr(
+        "module4_agent.code_generator.generate_model_py",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "module4_agent.code_generator.get_last_generation_error",
+        lambda: "provider returned an HTML page",
+    )
+
+    generated = generate_files(_specs(), llm_provider="openai")
+    info = json.loads(generated.files["generation_info.json"])
+
+    compile(generated.files["model.py"], "model.py", "exec")
+    assert info["llm_attempted"] is True
+    assert info["llm_used"] is False
+    assert info["template_fallback"] is True
+    assert info["fallback_reason"] == "provider returned an HTML page"
 
 
 def test_run_experiments_embeds_and_sweeps_all_candidates():
