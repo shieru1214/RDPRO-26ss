@@ -10,6 +10,11 @@ Open the Colab notebook for the `integration-update` branch:
 
 [Open `integration_update_colab.ipynb` in Colab](https://colab.research.google.com/github/Isso-W/Jiaozi/blob/codex/integration-update-colab/integration_update_colab.ipynb)
 
+For direct GPT-generated training on four Kaggle competitions and ten public
+image-classification datasets:
+
+[Open `vision_benchmarks_colab.ipynb` in Colab](https://colab.research.google.com/github/Isso-W/Jiaozi/blob/codex/integration-update-colab/vision_benchmarks_colab.ipynb)
+
 ## Pipeline
 
 The active integrated entry point is `pipeline.py`:

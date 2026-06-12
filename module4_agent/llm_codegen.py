@@ -74,7 +74,11 @@ def _call_openai(system_prompt: str, user_prompt: str) -> str | None:
     try:
         load_env_file()
         from openai import OpenAI
-        client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        client_kwargs = {"api_key": os.environ["OPENAI_API_KEY"]}
+        base_url = os.environ.get("OPENAI_BASE_URL", "").strip()
+        if base_url:
+            client_kwargs["base_url"] = base_url
+        client = OpenAI(**client_kwargs)
         resp = client.chat.completions.create(
             model=os.environ.get("M4_OPENAI_MODEL", "gpt-4o"),
             temperature=0,

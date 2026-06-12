@@ -48,6 +48,7 @@ def test_generation_info_defaults_to_template(monkeypatch):
     info = json.loads(generated.files["generation_info.json"])
 
     assert info["llm_provider"] == "none"
+    assert info["llm_model"] == ""
     assert info["model_py_source"] == "template"
     assert info["llm_used"] is False
     assert info["template_fallback"] is True
@@ -71,7 +72,13 @@ def test_run_uses_trained_model_for_evaluation():
     assert "model, train_result = train_model" in generated.files["run.py"]
     assert "eval_result = evaluate(model, config)" in generated.files["run.py"]
     assert "def _build_dataloader" in generated.files["train.py"]
+    assert "def _build_local_dataloader" in generated.files["train.py"]
+    assert "train_csv" in generated.files["train.py"]
+    assert "ImageFolder" in generated.files["train.py"]
     assert "torch.save" in generated.files["train.py"]
+    assert "cohen_kappa_score" in generated.files["evaluate.py"]
+    assert "roc_auc_score" in generated.files["evaluate.py"]
+    assert "log_loss" in generated.files["evaluate.py"]
 
 
 def test_feedback_is_embedded_into_generated_readme():
