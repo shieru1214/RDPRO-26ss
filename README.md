@@ -4,6 +4,12 @@ Jiaozi is a CV Auto-DL prototype. Given a natural-language task request and a
 HuggingFace image dataset id, it recommends CV model configurations and can
 generate runnable local training/evaluation/inference code.
 
+## Colab
+
+Open the Colab notebook for the `integration-update` branch:
+
+[Open `integration_update_colab.ipynb` in Colab](https://colab.research.google.com/github/Isso-W/Jiaozi/blob/codex/integration-update-colab/integration_update_colab.ipynb)
+
 ## Pipeline
 
 The active integrated entry point is `pipeline.py`:
