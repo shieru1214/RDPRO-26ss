@@ -51,6 +51,8 @@ cells = [
 
 只需在下一格修改 `BENCHMARK_KEY`。Kaggle 比赛必须先在网页上接受比赛规则。
 State Farm、SIIM-ISIC 和 Diabetic Retinopathy 数据较大，免费 Colab 可能需要较长下载时间和更多磁盘空间。
+
+如果之前运行过旧版本，请先选择 **Runtime → Restart session**，再从第一格开始运行。
 """
     ),
     code(
@@ -61,6 +63,9 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import urllib.request
+import zipfile
 from pathlib import Path
 
 # 只改这里即可切换任务。
@@ -72,7 +77,7 @@ EPOCHS = 2 if FAST_MODE else 10
 MAX_TRAIN_SAMPLES = 2000 if FAST_MODE else 0
 MAX_EVAL_SAMPLES = 500 if FAST_MODE else 0
 
-REPO_URL = "https://github.com/Isso-W/Jiaozi.git"
+DEFAULT_REPO_URL = "https://github.com/Isso-W/Jiaozi.git"
 REPO_REF = "codex/integration-update-colab"
 REPO_DIR = Path("/content/Jiaozi")
 DATA_ROOT = Path("/content/jiaozi_data")
@@ -81,24 +86,78 @@ OUTPUT_DIR = Path("/content/jiaozi_generated_training")
 
 def normalize_repo_url(value: str) -> str:
     value = (value or "").strip()
-    match = re.fullmatch(r"\[(.*?)\]\((https?://[^)]+)\)", value)
+    match = re.search(r"\]\((https?://[^)]+)\)", value)
     if match:
-        return match.group(2)
-    match = re.search(r"https?://\S+", value)
-    return match.group(0) if match else value
+        value = match.group(1)
+    match = re.search(
+        r"https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+(?:\.git)?",
+        value,
+    )
+    return match.group(0) if match else ""
 
 
-REPO_URL = normalize_repo_url(os.getenv("JIAOZI_REPO_URL", REPO_URL))
-REPO_REF = os.getenv("JIAOZI_REPO_REF", REPO_REF)
+REPO_URL = normalize_repo_url(DEFAULT_REPO_URL)
+if not REPO_URL:
+    raise RuntimeError(f"Invalid repository URL: {DEFAULT_REPO_URL!r}")
+if os.getenv("JIAOZI_REPO_URL") or os.getenv("JIAOZI_REPO_REF"):
+    print(
+        "Ignoring JIAOZI_REPO_URL/JIAOZI_REPO_REF from the old Colab runtime; "
+        "this notebook always pulls the tested branch."
+    )
 
 for path in (REPO_DIR, OUTPUT_DIR):
     if path.exists():
         shutil.rmtree(path)
 
-subprocess.run(
-    ["git", "clone", "--depth", "1", "--branch", REPO_REF, REPO_URL, str(REPO_DIR)],
-    check=True,
-)
+
+def checkout_repository() -> None:
+    clone_command = [
+        "git",
+        "clone",
+        "--depth",
+        "1",
+        "--branch",
+        REPO_REF,
+        REPO_URL,
+        str(REPO_DIR),
+    ]
+    print("Repository URL:", REPO_URL)
+    print("Repository ref:", REPO_REF)
+    for attempt in range(1, 4):
+        if REPO_DIR.exists():
+            shutil.rmtree(REPO_DIR)
+        completed = subprocess.run(clone_command, capture_output=True, text=True)
+        if completed.returncode == 0:
+            print(completed.stdout or completed.stderr)
+            return
+        print(f"git clone attempt {attempt}/3 failed with exit {completed.returncode}")
+        print(completed.stdout)
+        print(completed.stderr)
+        time.sleep(attempt)
+
+    print("Falling back to the GitHub branch ZIP archive.")
+    archive_path = Path("/content/jiaozi_branch.zip")
+    extract_root = Path("/content/jiaozi_branch_extract")
+    if archive_path.exists():
+        archive_path.unlink()
+    if extract_root.exists():
+        shutil.rmtree(extract_root)
+    extract_root.mkdir(parents=True)
+    archive_url = (
+        "https://codeload.github.com/Isso-W/Jiaozi/zip/refs/heads/"
+        + REPO_REF
+    )
+    print("Archive URL:", archive_url)
+    urllib.request.urlretrieve(archive_url, archive_path)
+    with zipfile.ZipFile(archive_path) as handle:
+        handle.extractall(extract_root)
+    extracted_dirs = [path for path in extract_root.iterdir() if path.is_dir()]
+    if len(extracted_dirs) != 1:
+        raise RuntimeError(f"Unexpected GitHub archive contents: {extracted_dirs}")
+    shutil.move(str(extracted_dirs[0]), str(REPO_DIR))
+
+
+checkout_repository()
 os.chdir(REPO_DIR)
 sys.path.insert(0, str(REPO_DIR))
 
