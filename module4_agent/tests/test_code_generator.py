@@ -48,9 +48,32 @@ def test_generation_info_defaults_to_template(monkeypatch):
     info = json.loads(generated.files["generation_info.json"])
 
     assert info["llm_provider"] == "none"
+    assert info["llm_model"] == ""
+    assert info["llm_attempted"] is False
     assert info["model_py_source"] == "template"
     assert info["llm_used"] is False
     assert info["template_fallback"] is True
+    assert info["fallback_reason"] == ""
+
+
+def test_invalid_llm_output_falls_back_to_compiling_template(monkeypatch):
+    monkeypatch.setattr(
+        "module4_agent.code_generator.generate_model_py",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        "module4_agent.code_generator.get_last_generation_error",
+        lambda: "provider returned an HTML page",
+    )
+
+    generated = generate_files(_specs(), llm_provider="openai")
+    info = json.loads(generated.files["generation_info.json"])
+
+    compile(generated.files["model.py"], "model.py", "exec")
+    assert info["llm_attempted"] is True
+    assert info["llm_used"] is False
+    assert info["template_fallback"] is True
+    assert info["fallback_reason"] == "provider returned an HTML page"
 
 
 def test_run_experiments_embeds_and_sweeps_all_candidates():
@@ -71,7 +94,20 @@ def test_run_uses_trained_model_for_evaluation():
     assert "model, train_result = train_model" in generated.files["run.py"]
     assert "eval_result = evaluate(model, config)" in generated.files["run.py"]
     assert "def _build_dataloader" in generated.files["train.py"]
+    assert "def _build_local_dataloader" in generated.files["train.py"]
+    assert "train_csv" in generated.files["train.py"]
+    assert "ImageFolder" in generated.files["train.py"]
     assert "torch.save" in generated.files["train.py"]
+    assert "cohen_kappa_score" in generated.files["evaluate.py"]
+    assert "roc_auc_score" in generated.files["evaluate.py"]
+    assert "log_loss" in generated.files["evaluate.py"]
+    assert "RandomResizedCrop" in generated.files["train.py"]
+    assert "use_class_weights" in generated.files["train.py"]
+    assert "label_smoothing" in generated.files["train.py"]
+    assert "GradScaler" in generated.files["train.py"]
+    assert "CosineAnnealingLR" in generated.files["train.py"]
+    assert "last_checkpoint.pt" in generated.files["train.py"]
+    assert "early_stopping_patience" in generated.files["train.py"]
 
 
 def test_feedback_is_embedded_into_generated_readme():

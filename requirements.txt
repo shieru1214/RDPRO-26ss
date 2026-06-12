@@ -9,6 +9,7 @@ numpy
 openai>=2.0.0
 pandas
 pillow
+scikit-learn
 sentence-transformers
 torch
 torchvision

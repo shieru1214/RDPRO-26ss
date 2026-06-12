@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
+import os
 from collections.abc import Sequence
 from textwrap import dedent
 
-from .llm_codegen import generate_model_py, get_provider
+from .llm_codegen import generate_model_py, get_last_generation_error, get_provider
 from .schemas import GeneratedFiles, TrainingSpec
 from .spec_builder import specs_to_configs
 
@@ -48,10 +49,16 @@ def generate_files(
     # LLM 只生成 model.py（使用 model_utils helper），train/evaluate 始终用模板
     llm_model = generate_model_py(specs[0], feedback=feedback or "", provider=provider)
     model_source = provider if llm_model else "template"
+    fallback_reason = get_last_generation_error() if not llm_model and provider != "none" else ""
 
     files = {
         "configs.json": configs_json + "\n",
-        "generation_info.json": _generation_info_json(provider, model_source, llm_model is not None),
+        "generation_info.json": _generation_info_json(
+            provider,
+            model_source,
+            llm_model is not None,
+            fallback_reason=fallback_reason,
+        ),
         "utils.py": _utils_py(),
         "model_utils.py": _model_utils_py(),
         "smoke_data.py": _smoke_data_py(),
@@ -67,12 +74,28 @@ def generate_files(
     return GeneratedFiles(files=files)
 
 
-def _generation_info_json(provider: str, model_source: str, llm_used: bool) -> str:
+def _generation_info_json(
+    provider: str,
+    model_source: str,
+    llm_used: bool,
+    *,
+    fallback_reason: str = "",
+) -> str:
+    model_name = ""
+    if provider == "openai":
+        model_name = os.environ.get("M4_OPENAI_MODEL", "gpt-4o")
+    elif provider == "qwen":
+        model_name = os.environ.get("M4_QWEN_MODEL", "qwen-plus")
+    elif provider == "vertex":
+        model_name = os.environ.get("M4_VERTEX_MODEL", "gemini-2.0-flash")
     info = {
         "model_py_source": model_source,
         "llm_provider": provider,
+        "llm_model": model_name,
+        "llm_attempted": provider != "none",
         "llm_used": llm_used,
         "template_fallback": not llm_used,
+        "fallback_reason": fallback_reason,
         "generated_by": "module4_agent",
     }
     return json.dumps(info, indent=2, sort_keys=True) + "\n"
@@ -310,6 +333,8 @@ def _model_utils_py() -> str:
             "efficientnet": "efficientnet_b0",
             "efficientnet_b0": "efficientnet_b0",
             "efficientnet_b1": "efficientnet_b1",
+            "efficientnet_b2": "efficientnet_b2",
+            "efficientnet_b3": "efficientnet_b3",
             "convnext": "convnext_tiny",
             "convnext_tiny": "convnext_tiny",
             "regnet": "regnet_y_400mf",
@@ -678,6 +703,7 @@ def _train_py() -> str:
 
         from __future__ import annotations
 
+        import random
         import time
         from pathlib import Path
         from typing import Any
@@ -705,15 +731,32 @@ def _train_py() -> str:
             return torch.optim.AdamW(trainable, lr=lr)
 
 
-        def _loss_for_output(output: Any, target: Any, config: dict[str, Any] | None) -> torch.Tensor:
+        def _loss_for_output(
+            output: Any,
+            target: Any,
+            config: dict[str, Any] | None,
+            class_weights: torch.Tensor | None = None,
+        ) -> torch.Tensor:
             task = task_type(config)
             loss_name = str(get_value(config, "loss", "")).lower()
+            label_smoothing = as_float(get_value(config, "label_smoothing", 0.0), 0.0)
             if task == "classification":
                 if "focal" in loss_name:
-                    ce = F.cross_entropy(output, target, reduction="none")
+                    ce = F.cross_entropy(
+                        output,
+                        target,
+                        weight=class_weights,
+                        label_smoothing=label_smoothing,
+                        reduction="none",
+                    )
                     pt = torch.exp(-ce)
                     return (((1.0 - pt) ** 2.0) * ce).mean()
-                return F.cross_entropy(output, target)
+                return F.cross_entropy(
+                    output,
+                    target,
+                    weight=class_weights,
+                    label_smoothing=label_smoothing,
+                )
             if task == "image_segmentation":
                 if "focal" in loss_name:
                     ce = F.cross_entropy(output, target, reduction="none")
@@ -731,13 +774,228 @@ def _train_py() -> str:
             return F.cross_entropy(output, target)
 
 
+        def _build_image_transform(config: dict[str, Any], split: str):
+            from torchvision import transforms
+
+            image_size = as_int(get_value(config, "image_size", 224), 224)
+            augmentation = str(get_value(config, "augmentation", "basic") or "basic").lower()
+            normalize = transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            )
+            if split == "train" and augmentation in {"strong", "competition", "advanced"}:
+                return transforms.Compose([
+                    transforms.RandomResizedCrop(
+                        image_size,
+                        scale=(0.65, 1.0),
+                        ratio=(0.75, 1.3333333333),
+                    ),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.RandomVerticalFlip(),
+                    transforms.RandomRotation(20),
+                    transforms.ColorJitter(
+                        brightness=0.2,
+                        contrast=0.2,
+                        saturation=0.2,
+                        hue=0.05,
+                    ),
+                    transforms.ToTensor(),
+                    normalize,
+                    transforms.RandomErasing(
+                        p=0.2,
+                        scale=(0.02, 0.15),
+                        ratio=(0.3, 3.3),
+                    ),
+                ])
+            if split == "train":
+                return transforms.Compose([
+                    transforms.Resize((image_size, image_size)),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                    normalize,
+                ])
+            resize_size = max(image_size, round(image_size * 1.1))
+            return transforms.Compose([
+                transforms.Resize((resize_size, resize_size)),
+                transforms.CenterCrop(image_size),
+                transforms.ToTensor(),
+                normalize,
+            ])
+
+
+        def _balanced_class_weights(
+            labels: list[int],
+            num_classes: int,
+            power: float,
+        ) -> tuple[torch.Tensor, list[int]]:
+            counts = torch.bincount(
+                torch.tensor(labels, dtype=torch.long),
+                minlength=num_classes,
+            ).float()
+            safe_counts = counts.clamp_min(1.0)
+            weights = (counts.sum() / (max(num_classes, 1) * safe_counts)).pow(power)
+            weights = weights / weights.mean().clamp_min(1.0e-12)
+            weights[counts == 0] = 0.0
+            return weights, [int(value) for value in counts.tolist()]
+
+
+        def _split_indices(labels: list[int], validation_fraction: float, seed: int):
+            grouped: dict[int, list[int]] = {}
+            for index, label in enumerate(labels):
+                grouped.setdefault(int(label), []).append(index)
+            rng = random.Random(seed)
+            train_indices: list[int] = []
+            validation_indices: list[int] = []
+            for class_indices in grouped.values():
+                shuffled = list(class_indices)
+                rng.shuffle(shuffled)
+                if len(shuffled) < 2:
+                    train_indices.extend(shuffled)
+                    continue
+                validation_count = max(1, round(len(shuffled) * validation_fraction))
+                validation_count = min(validation_count, len(shuffled) - 1)
+                validation_indices.extend(shuffled[:validation_count])
+                train_indices.extend(shuffled[validation_count:])
+            rng.shuffle(train_indices)
+            rng.shuffle(validation_indices)
+            return train_indices, validation_indices
+
+
+        def _build_local_dataloader(config: dict[str, Any], split: str, batch_size: int):
+            train_csv = str(get_value(config, "train_csv", "") or "").strip()
+            image_dir = str(get_value(config, "image_dir", "") or "").strip()
+            if not train_csv and not image_dir:
+                return None
+
+            import pandas as pd
+            from PIL import Image
+            from torchvision import datasets as tv_datasets
+
+            transform = _build_image_transform(config, split)
+            seed = as_int(get_value(config, "seed", 42), 42)
+            validation_fraction = as_float(get_value(config, "validation_fraction", 0.2), 0.2)
+            max_samples_key = "max_train_samples" if split == "train" else "max_eval_samples"
+            max_samples = as_int(get_value(config, max_samples_key, 0), 0)
+
+            if train_csv:
+                csv_path = Path(train_csv).expanduser().resolve()
+                if not csv_path.exists():
+                    raise FileNotFoundError(f"train_csv does not exist: {csv_path}")
+                frame = pd.read_csv(csv_path)
+                image_column = str(get_value(config, "image_column", "image") or "image")
+                label_column = str(get_value(config, "label_column", "label") or "label")
+                if image_column not in frame.columns or label_column not in frame.columns:
+                    raise ValueError(
+                        f"CSV must contain {image_column!r} and {label_column!r}; "
+                        f"available columns: {list(frame.columns)}"
+                    )
+
+                label_values = frame[label_column].tolist()
+                unique_labels = sorted(set(label_values), key=lambda value: str(value))
+                label_to_index = {value: index for index, value in enumerate(unique_labels)}
+                encoded_labels = [label_to_index[value] for value in label_values]
+                train_indices, validation_indices = _split_indices(
+                    encoded_labels,
+                    validation_fraction=validation_fraction,
+                    seed=seed,
+                )
+                selected_indices = train_indices if split == "train" else validation_indices
+                if max_samples > 0:
+                    selected_indices = selected_indices[:max_samples]
+                selected_frame = frame.iloc[selected_indices].reset_index(drop=True)
+                selected_labels = [encoded_labels[index] for index in selected_indices]
+                base_dir = Path(image_dir).expanduser().resolve() if image_dir else csv_path.parent
+                path_template = str(get_value(config, "image_path_template", "{image}") or "{image}")
+                image_extension = str(get_value(config, "image_extension", "") or "")
+
+                class CSVImageDataset(torch.utils.data.Dataset):
+                    def __init__(self):
+                        self.class_weights = None
+                        self.class_counts = []
+                        if split == "train" and as_bool(
+                            get_value(config, "use_class_weights", False),
+                            False,
+                        ):
+                            power = as_float(get_value(config, "class_weight_power", 0.5), 0.5)
+                            self.class_weights, self.class_counts = _balanced_class_weights(
+                                selected_labels,
+                                len(unique_labels),
+                                power,
+                            )
+
+                    def __len__(self):
+                        return len(selected_frame)
+
+                    def __getitem__(self, index):
+                        row = selected_frame.iloc[index]
+                        image_value = str(row[image_column])
+                        relative = path_template.format(
+                            image=image_value,
+                            label=str(row[label_column]),
+                            stem=Path(image_value).stem,
+                        )
+                        image_path = base_dir / relative
+                        if image_extension and not image_path.suffix:
+                            image_path = image_path.with_suffix(image_extension)
+                        with Image.open(image_path) as image:
+                            tensor = transform(image.convert("RGB"))
+                        return tensor, torch.tensor(selected_labels[index], dtype=torch.long)
+
+                dataset = CSVImageDataset()
+                workers = as_int(get_value(config, "num_workers", 2), 2)
+                return torch.utils.data.DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=split == "train",
+                    num_workers=workers,
+                    pin_memory=torch.cuda.is_available(),
+                    persistent_workers=workers > 0,
+                )
+
+            image_root = Path(image_dir).expanduser().resolve()
+            if not image_root.exists():
+                raise FileNotFoundError(f"image_dir does not exist: {image_root}")
+            dataset = tv_datasets.ImageFolder(image_root, transform=transform)
+            labels = [int(label) for _, label in dataset.samples]
+            train_indices, validation_indices = _split_indices(
+                labels,
+                validation_fraction=validation_fraction,
+                seed=seed,
+            )
+            selected_indices = train_indices if split == "train" else validation_indices
+            if max_samples > 0:
+                selected_indices = selected_indices[:max_samples]
+            subset = torch.utils.data.Subset(dataset, selected_indices)
+            if split == "train" and as_bool(get_value(config, "use_class_weights", False), False):
+                selected_labels = [labels[index] for index in selected_indices]
+                power = as_float(get_value(config, "class_weight_power", 0.5), 0.5)
+                subset.class_weights, subset.class_counts = _balanced_class_weights(
+                    selected_labels,
+                    len(dataset.classes),
+                    power,
+                )
+            workers = as_int(get_value(config, "num_workers", 2), 2)
+            return torch.utils.data.DataLoader(
+                subset,
+                batch_size=batch_size,
+                shuffle=split == "train",
+                num_workers=workers,
+                pin_memory=torch.cuda.is_available(),
+                persistent_workers=workers > 0,
+            )
+
+
         def _build_dataloader(config: dict[str, Any], split: str = "train", batch_size: int = 32):
-            """Build a DataLoader from a HuggingFace dataset.
+            """Build a DataLoader from local Kaggle files or a HuggingFace dataset.
 
             Returns None if the dataset cannot be loaded (caller falls back to
             synthetic data).  Currently supports classification and feature_extraction;
             detection / segmentation fall back to synthetic data.
             """
+            local_loader = _build_local_dataloader(config, split, batch_size)
+            if local_loader is not None:
+                return local_loader
+
             dataset_id = str(get_value(config, "dataset_id", "") or "").strip()
             if not dataset_id:
                 return None
@@ -763,7 +1021,6 @@ def _train_py() -> str:
 
             try:
                 from datasets import load_dataset
-                from torchvision import transforms
             except ImportError:
                 print("[train] 'datasets' or 'torchvision' not installed; using synthetic data.")
                 return None
@@ -774,19 +1031,20 @@ def _train_py() -> str:
                     ds = load_dataset(dataset_id, subset, trust_remote_code=True)
                 except (TypeError, ValueError):
                     ds = load_dataset(dataset_id, subset)
-                if split not in ds:
-                    split = list(ds.keys())[0]
-                ds_split = ds[split]
+                requested_split = split
+                if requested_split == "train":
+                    source_split = "train" if "train" in ds else list(ds.keys())[0]
+                else:
+                    source_split = next(
+                        (name for name in ("validation", "test", "val") if name in ds),
+                        "train" if "train" in ds else list(ds.keys())[0],
+                    )
+                ds_split = ds[source_split]
             except Exception as exc:
                 print(f"[train] Failed to load dataset {dataset_id!r}: {exc}")
                 return None
 
-            image_size = as_int(get_value(config, "image_size", 224), 224)
-            transform = transforms.Compose([
-                transforms.Resize((image_size, image_size)),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            ])
+            transform = _build_image_transform(config, requested_split)
 
             cols = ds_split.column_names
             image_col = "image" if "image" in cols else ("img" if "img" in cols else None)
@@ -794,6 +1052,23 @@ def _train_py() -> str:
             if image_col is None:
                 print("[train] No image column found in dataset; using synthetic data.")
                 return None
+            seed = as_int(get_value(config, "seed", 42), 42)
+            validation_fraction = as_float(get_value(config, "validation_fraction", 0.2), 0.2)
+            has_dedicated_eval_split = any(name in ds for name in ("validation", "test", "val"))
+            if not has_dedicated_eval_split and len(ds_split) > 1:
+                shuffled = ds_split.shuffle(seed=seed)
+                validation_count = max(1, round(len(shuffled) * validation_fraction))
+                validation_count = min(validation_count, len(shuffled) - 1)
+                split_at = len(shuffled) - validation_count
+                ds_split = (
+                    shuffled.select(range(split_at))
+                    if requested_split == "train"
+                    else shuffled.select(range(split_at, len(shuffled)))
+                )
+            max_samples_key = "max_train_samples" if requested_split == "train" else "max_eval_samples"
+            max_samples = as_int(get_value(config, max_samples_key, 0), 0)
+            if max_samples > 0 and len(ds_split) > max_samples:
+                ds_split = ds_split.select(range(max_samples))
 
             class _HFDataset(torch.utils.data.Dataset):
                 def __init__(self, hf_ds, img_col, lbl_col, tfm):
@@ -815,8 +1090,102 @@ def _train_py() -> str:
                     return img, torch.tensor(lbl, dtype=torch.long)
 
             wrapped = _HFDataset(ds_split, image_col, label_col, transform)
+            workers = as_int(get_value(config, "num_workers", 2), 2)
             return torch.utils.data.DataLoader(
-                wrapped, batch_size=batch_size, shuffle=True, num_workers=0, drop_last=True,
+                wrapped,
+                batch_size=batch_size,
+                shuffle=requested_split == "train",
+                num_workers=workers,
+                pin_memory=torch.cuda.is_available(),
+                drop_last=False,
+                persistent_workers=workers > 0,
+            )
+
+
+        def _classification_validation(
+            model: torch.nn.Module,
+            dataloader,
+            config: dict[str, Any],
+            device: torch.device,
+        ) -> dict[str, float]:
+            model.eval()
+            predictions: list[torch.Tensor] = []
+            labels: list[torch.Tensor] = []
+            probabilities: list[torch.Tensor] = []
+            with torch.no_grad():
+                for x, target in dataloader:
+                    x = x.to(device, non_blocking=True)
+                    target = target.to(device, non_blocking=True)
+                    logits = model(x)
+                    probs = torch.softmax(logits, dim=1)
+                    predictions.append(probs.argmax(dim=1).cpu())
+                    labels.append(target.cpu())
+                    probabilities.append(probs.cpu())
+            pred_values = torch.cat(predictions)
+            label_values = torch.cat(labels)
+            probability_values = torch.cat(probabilities)
+            accuracy = float((pred_values == label_values).float().mean().item())
+            metric_name = str(
+                get_value(config, "evaluation_metric", "accuracy") or "accuracy"
+            ).lower()
+            metric_value = accuracy
+            try:
+                from sklearn.metrics import cohen_kappa_score, log_loss, roc_auc_score
+                labels_np = label_values.numpy()
+                probabilities_np = probability_values.numpy()
+                if metric_name in {"qwk", "quadratic_weighted_kappa"}:
+                    metric_name = "qwk"
+                    metric_value = float(
+                        cohen_kappa_score(
+                            labels_np,
+                            pred_values.numpy(),
+                            weights="quadratic",
+                        )
+                    )
+                elif metric_name in {"roc_auc", "auc"}:
+                    metric_name = "roc_auc"
+                    if probabilities_np.shape[1] == 2:
+                        metric_value = float(roc_auc_score(labels_np, probabilities_np[:, 1]))
+                    else:
+                        metric_value = float(
+                            roc_auc_score(labels_np, probabilities_np, multi_class="ovr")
+                        )
+                elif metric_name in {"log_loss", "multiclass_log_loss"}:
+                    metric_name = "log_loss"
+                    metric_value = float(
+                        log_loss(
+                            labels_np,
+                            probabilities_np,
+                            labels=list(range(probabilities_np.shape[1])),
+                        )
+                    )
+            except (ImportError, ValueError) as exc:
+                print(f"[train] Validation metric {metric_name} failed: {exc}; using accuracy.")
+                metric_name = "accuracy"
+                metric_value = accuracy
+            model.train()
+            return {
+                "metric_name": metric_name,
+                "metric_value": metric_value,
+                "accuracy": accuracy,
+            }
+
+
+        def _build_scheduler(
+            optimizer: torch.optim.Optimizer,
+            config: dict[str, Any],
+            epochs: int,
+        ):
+            scheduler_name = str(
+                get_value(config, "scheduler", "cosine") or "cosine"
+            ).lower()
+            if scheduler_name in {"none", "off", ""}:
+                return None
+            min_lr = as_float(get_value(config, "min_learning_rate", 1.0e-6), 1.0e-6)
+            return torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, int(epochs)),
+                eta_min=min_lr,
             )
 
 
@@ -838,34 +1207,129 @@ def _train_py() -> str:
             task = task_type(config)
             offline_smoke = as_bool(get_value(config, "offline_smoke", True), True)
             model = build_model(config)
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            if device.type == "cuda":
+                torch.backends.cudnn.benchmark = True
+            model.to(device)
             model.train()
             optimizer = _build_optimizer(model, config)
+            scheduler = _build_scheduler(optimizer, config, epochs)
+            amp_enabled = (
+                device.type == "cuda"
+                and as_bool(get_value(config, "mixed_precision", True), True)
+            )
+            try:
+                scaler = torch.amp.GradScaler("cuda", enabled=amp_enabled)
+            except (AttributeError, TypeError):
+                scaler = torch.cuda.amp.GradScaler(enabled=amp_enabled)
             loss_value = 0.0
             total_steps = 0
             epoch_losses: list[float] = []
+            validation_history: list[dict[str, Any]] = []
+            best_metric: float | None = None
+            best_epoch = 0
+            start_epoch = 0
 
             dataloader = None
+            validation_loader = None
             if not offline_smoke and data is None:
                 batch_size = as_int(get_value(config, "batch_size", 32), 32)
                 dataloader = _build_dataloader(config, split="train", batch_size=batch_size)
+                if task == "classification":
+                    eval_batch_size = as_int(
+                        get_value(config, "eval_batch_size", batch_size * 2),
+                        batch_size * 2,
+                    )
+                    validation_loader = _build_dataloader(
+                        config,
+                        split="test",
+                        batch_size=eval_batch_size,
+                    )
 
             if dataloader is not None:
                 if save_dir is None:
-                    save_dir = "checkpoints"
-                Path(save_dir).mkdir(parents=True, exist_ok=True)
+                    save_dir = str(get_value(config, "checkpoint_dir", "checkpoints"))
+                checkpoint_dir = Path(save_dir)
+                checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                class_weights = getattr(dataloader.dataset, "class_weights", None)
+                class_counts = getattr(dataloader.dataset, "class_counts", [])
+                if isinstance(class_weights, torch.Tensor):
+                    class_weights = class_weights.to(device)
+                    print(
+                        "[train] class counts=",
+                        class_counts,
+                        " weights=",
+                        [round(float(value), 4) for value in class_weights.cpu().tolist()],
+                    )
 
-                for epoch in range(max(1, int(epochs))):
+                resume_checkpoint = str(
+                    get_value(config, "resume_checkpoint", "") or ""
+                ).strip()
+                if resume_checkpoint.lower() == "auto":
+                    resume_checkpoint = str(checkpoint_dir / "last_checkpoint.pt")
+                if resume_checkpoint and Path(resume_checkpoint).exists():
+                    checkpoint = torch.load(resume_checkpoint, map_location=device)
+                    model.load_state_dict(checkpoint["model_state_dict"])
+                    optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                    if scheduler is not None and checkpoint.get("scheduler_state_dict"):
+                        scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                    if checkpoint.get("scaler_state_dict"):
+                        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+                    start_epoch = int(checkpoint.get("epoch", 0))
+                    best_metric = checkpoint.get("best_metric")
+                    best_epoch = int(checkpoint.get("best_epoch", 0))
+                    print(f"[train] Resuming from {resume_checkpoint} at epoch {start_epoch + 1}.")
+
+                metric_name = str(
+                    get_value(config, "evaluation_metric", "accuracy") or "accuracy"
+                ).lower()
+                minimize_metric = metric_name in {"log_loss", "multiclass_log_loss", "rmse"}
+                early_stopping_patience = as_int(
+                    get_value(config, "early_stopping_patience", 0),
+                    0,
+                )
+                epochs_without_improvement = 0
+                gradient_clip_norm = as_float(
+                    get_value(config, "gradient_clip_norm", 1.0),
+                    1.0,
+                )
+                save_every_epoch = as_bool(
+                    get_value(config, "save_every_epoch", False),
+                    False,
+                )
+
+                for epoch in range(start_epoch, max(1, int(epochs))):
                     epoch_loss = 0.0
                     batch_count = 0
                     for x, target in dataloader:
+                        x = x.to(device, non_blocking=True)
+                        if isinstance(target, torch.Tensor):
+                            target = target.to(device, non_blocking=True)
                         optimizer.zero_grad(set_to_none=True)
-                        if task == "object_detection":
-                            output = model(x, target)
-                        else:
-                            output = model(x)
-                        loss = _loss_for_output(output, target, config)
-                        loss.backward()
-                        optimizer.step()
+                        with torch.autocast(
+                            device_type=device.type,
+                            dtype=torch.float16,
+                            enabled=amp_enabled,
+                        ):
+                            if task == "object_detection":
+                                output = model(x, target)
+                            else:
+                                output = model(x)
+                            loss = _loss_for_output(
+                                output,
+                                target,
+                                config,
+                                class_weights=class_weights,
+                            )
+                        scaler.scale(loss).backward()
+                        if gradient_clip_norm > 0:
+                            scaler.unscale_(optimizer)
+                            torch.nn.utils.clip_grad_norm_(
+                                model.parameters(),
+                                gradient_clip_norm,
+                            )
+                        scaler.step(optimizer)
+                        scaler.update()
                         loss_value = float(loss.detach().cpu().item())
                         epoch_loss += loss_value
                         batch_count += 1
@@ -874,29 +1338,96 @@ def _train_py() -> str:
                             break
                     avg_loss = epoch_loss / max(batch_count, 1)
                     epoch_losses.append(avg_loss)
-                    print(f"[train] epoch {epoch + 1}/{epochs}  loss={avg_loss:.4f}  "
-                          f"steps={batch_count}  time={time.time() - start:.1f}s")
+                    validation_result = None
+                    if validation_loader is not None:
+                        validation_result = _classification_validation(
+                            model,
+                            validation_loader,
+                            config,
+                            device,
+                        )
+                        validation_result["epoch"] = epoch + 1
+                        validation_history.append(validation_result)
+                    if scheduler is not None:
+                        scheduler.step()
 
-                    ckpt_path = Path(save_dir) / f"checkpoint_epoch{epoch + 1}.pt"
-                    torch.save({
+                    current_lr = float(optimizer.param_groups[0]["lr"])
+                    metric_text = ""
+                    improved = best_metric is None
+                    if validation_result is not None:
+                        current_metric = float(validation_result["metric_value"])
+                        improved = (
+                            best_metric is None
+                            or (current_metric < best_metric if minimize_metric else current_metric > best_metric)
+                        )
+                        metric_text = (
+                            f"  val_{validation_result['metric_name']}={current_metric:.4f}"
+                            f"  val_acc={validation_result['accuracy']:.4f}"
+                        )
+                        if improved:
+                            best_metric = current_metric
+                            best_epoch = epoch + 1
+                            epochs_without_improvement = 0
+                        else:
+                            epochs_without_improvement += 1
+
+                    print(
+                        f"[train] epoch {epoch + 1}/{epochs}  loss={avg_loss:.4f}"
+                        f"{metric_text}  lr={current_lr:.2e}"
+                        f"  steps={batch_count}  time={time.time() - start:.1f}s"
+                    )
+
+                    checkpoint_payload = {
                         "epoch": epoch + 1,
                         "model_state_dict": model.state_dict(),
                         "optimizer_state_dict": optimizer.state_dict(),
+                        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
+                        "scaler_state_dict": scaler.state_dict(),
                         "loss": avg_loss,
-                    }, ckpt_path)
+                        "best_metric": best_metric,
+                        "best_epoch": best_epoch,
+                        "validation": validation_result,
+                        "config": config,
+                    }
+                    torch.save(checkpoint_payload, checkpoint_dir / "last_checkpoint.pt")
+                    if save_every_epoch:
+                        torch.save(
+                            checkpoint_payload,
+                            checkpoint_dir / f"checkpoint_epoch{epoch + 1}.pt",
+                        )
+                    if improved:
+                        torch.save(checkpoint_payload, checkpoint_dir / "best_model.pt")
+                        print(
+                            f"[train] Saved new best checkpoint at epoch {epoch + 1}: "
+                            f"{checkpoint_dir / 'best_model.pt'}"
+                        )
 
                     if max_steps > 0 and total_steps >= max_steps:
                         break
+                    if (
+                        early_stopping_patience > 0
+                        and epochs_without_improvement >= early_stopping_patience
+                    ):
+                        print(
+                            f"[train] Early stopping after {early_stopping_patience} "
+                            "epochs without validation improvement."
+                        )
+                        break
 
-                best_path = Path(save_dir) / "best_model.pt"
-                torch.save({"model_state_dict": model.state_dict()}, best_path)
-                print(f"[train] Done. Model saved to {best_path}")
+                best_path = checkpoint_dir / "best_model.pt"
+                if best_path.exists():
+                    best_checkpoint = torch.load(best_path, map_location=device)
+                    model.load_state_dict(best_checkpoint["model_state_dict"])
+                print(f"[train] Done. Best model: {best_path}")
             else:
                 batch = data if data is not None else synthetic_batch(config)
                 steps = max(1, int(max_steps)) if max_steps > 0 else 1
                 for _epoch in range(max(1, int(epochs))):
                     for _step in range(steps):
                         x, target = batch
+                        x = x.to(device)
+                        if isinstance(target, torch.Tensor):
+                            target = target.to(device)
                         optimizer.zero_grad(set_to_none=True)
                         if task == "object_detection":
                             output = model(x, target)
@@ -914,6 +1445,10 @@ def _train_py() -> str:
                 "loss": loss_value,
                 "total_steps": total_steps,
                 "epoch_losses": epoch_losses,
+                "validation_history": validation_history,
+                "best_metric": best_metric,
+                "best_epoch": best_epoch,
+                "mixed_precision": amp_enabled,
                 "runtime_sec": round(time.time() - start, 4),
                 "real_data": dataloader is not None,
                 "config_summary": {
@@ -1008,26 +1543,28 @@ def _evaluate_py() -> str:
             return {"total": total, "trainable": trainable}
 
 
-        def _eval_classification_batch(model: torch.nn.Module, x: torch.Tensor, target: torch.Tensor):
-            output = model(x)
-            preds = output.argmax(dim=1)
-            return preds, target
-
-
         def _eval_on_dataloader(model: torch.nn.Module, dataloader, config: dict[str, Any]) -> dict[str, Any]:
             """Evaluate on a full DataLoader (real data path)."""
             task = task_type(config)
             num_classes = max(1, as_int(get_value(config, "num_classes", 3), 3))
+            device = next(model.parameters()).device
             model.eval()
 
             all_preds: list[torch.Tensor] = []
             all_labels: list[torch.Tensor] = []
+            all_probabilities: list[torch.Tensor] = []
             with torch.no_grad():
                 for x, target in dataloader:
+                    x = x.to(device, non_blocking=True)
+                    if isinstance(target, torch.Tensor):
+                        target = target.to(device, non_blocking=True)
                     if task == "classification":
-                        preds, labels = _eval_classification_batch(model, x, target)
+                        logits = model(x)
+                        probabilities = torch.softmax(logits, dim=1)
+                        preds = probabilities.argmax(dim=1)
                         all_preds.append(preds)
-                        all_labels.append(labels)
+                        all_labels.append(target)
+                        all_probabilities.append(probabilities)
                     elif task == "feature_extraction":
                         output = model(x)
                         all_preds.append(output)
@@ -1038,12 +1575,45 @@ def _evaluate_py() -> str:
                         all_labels.append(target)
 
             if task == "classification":
-                preds = torch.cat(all_preds)
-                labels = torch.cat(all_labels)
+                preds = torch.cat(all_preds).cpu()
+                labels = torch.cat(all_labels).cpu()
+                probabilities = torch.cat(all_probabilities).cpu()
                 accuracy = float((preds == labels).float().mean().item())
+                requested_metric = str(get_value(config, "evaluation_metric", "accuracy") or "accuracy").lower()
+                metric_name = "accuracy"
+                metric_value = accuracy
+                try:
+                    from sklearn.metrics import cohen_kappa_score, log_loss, roc_auc_score
+                    label_values = labels.numpy()
+                    probability_values = probabilities.numpy()
+                    if requested_metric in {"qwk", "quadratic_weighted_kappa"}:
+                        metric_name = "qwk"
+                        metric_value = float(
+                            cohen_kappa_score(label_values, preds.numpy(), weights="quadratic")
+                        )
+                    elif requested_metric in {"roc_auc", "auc"}:
+                        metric_name = "roc_auc"
+                        if probability_values.shape[1] == 2:
+                            metric_value = float(roc_auc_score(label_values, probability_values[:, 1]))
+                        else:
+                            metric_value = float(
+                                roc_auc_score(label_values, probability_values, multi_class="ovr")
+                            )
+                    elif requested_metric in {"log_loss", "multiclass_log_loss"}:
+                        metric_name = "log_loss"
+                        metric_value = float(
+                            log_loss(
+                                label_values,
+                                probability_values,
+                                labels=list(range(num_classes)),
+                            )
+                        )
+                except (ImportError, ValueError) as exc:
+                    print(f"[evaluate] Could not compute {requested_metric}: {exc}; using accuracy.")
                 return {
-                    "metric_name": "accuracy",
-                    "metric_value": accuracy,
+                    "metric_name": metric_name,
+                    "metric_value": metric_value,
+                    "accuracy": accuracy,
                     "macro_f1": _macro_f1(preds, labels, num_classes),
                     "num_samples": len(labels),
                     "params": _count_params(model),
@@ -1090,6 +1660,18 @@ def _evaluate_py() -> str:
                     return _eval_on_dataloader(model, dataloader, config)
 
             x, target = data if data is not None else synthetic_batch(config)
+            device = next(model.parameters()).device
+            x = x.to(device)
+            if isinstance(target, torch.Tensor):
+                target = target.to(device)
+            elif isinstance(target, list):
+                target = [
+                    {
+                        key: value.to(device) if isinstance(value, torch.Tensor) else value
+                        for key, value in item.items()
+                    }
+                    for item in target
+                ]
             model.eval()
             with torch.no_grad():
                 output = model(x)
@@ -1178,11 +1760,13 @@ def _infer_py() -> str:
                     checkpoint = torch.load(weights_path, map_location="cpu")
                     state_dict = checkpoint.get("model_state_dict", checkpoint) if isinstance(checkpoint, dict) else checkpoint
                     model.load_state_dict(state_dict, strict=False)
+            device = next(model.parameters()).device
             model.eval()
             if image is None:
                 image = synthetic_image(config, batch_size=1)
             if image.dim() == 3:
                 image = image.unsqueeze(0)
+            image = image.to(device)
 
             with torch.no_grad():
                 output = model(image)
@@ -1349,7 +1933,7 @@ def _run_experiments_py(configs_json: str) -> str:
 
 
 def _requirements_txt() -> str:
-    return "torch\ntorchvision\ntransformers\ndatasets\nPillow\n"
+    return "torch\ntorchvision\ntransformers\ndatasets\nPillow\npandas\nscikit-learn\n"
 
 
 def _readme_generated_md(
@@ -1403,8 +1987,10 @@ def _readme_generated_md(
         - `smoke_data.py`: shared synthetic data helpers for local smoke runs.
         - `model.py`: task-compatible PyTorch models with `build_model(config)`.
           Uses TinyBackbone in smoke mode, real pretrained backbone otherwise.
-        - `train.py`: training loop with real-data dataloader, multi-epoch
-          support, and checkpoint saving when `offline_smoke: false`.
+        - `train.py`: training loop with HuggingFace, Kaggle CSV/image, and
+          ImageFolder dataloaders, strong augmentation, class weighting,
+          mixed precision, validation, early stopping, resumable training,
+          and best/last checkpoint saving when `offline_smoke: false`.
         - `evaluate.py`: metrics by task type.
         - `infer.py`: `predict(weights_path=None, image=None, config=None)`.
         - `run.py`: single-configuration runner (smoke or real).
@@ -1437,9 +2023,9 @@ def _readme_generated_md(
         `use_pretrained: true` in the config.  What changes:
         - `model.py` loads the real backbone via `model_utils.load_backbone`
           (HuggingFace checkpoint → torchvision → TinyBackbone fallback)
-        - `train.py` loads the HuggingFace dataset specified by `dataset_id`
-          in the config (classification / feature_extraction; detection and
-          segmentation fall back to synthetic data for now)
+        - `train.py` loads either the HuggingFace dataset specified by
+          `dataset_id`, a local CSV dataset specified by `train_csv`, or an
+          ImageFolder dataset specified by `image_dir`
         - Multi-epoch training with per-epoch logging
         - Checkpoints saved to `checkpoints/` after each epoch
         - Requires: `pip install transformers datasets Pillow`

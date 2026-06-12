@@ -4,6 +4,22 @@ Jiaozi is a CV Auto-DL prototype. Given a natural-language task request and a
 HuggingFace image dataset id, it recommends CV model configurations and can
 generate runnable local training/evaluation/inference code.
 
+## Colab
+
+Open the Colab notebook for the `integration-update` branch:
+
+[Open `integration_update_colab.ipynb` in Colab](https://colab.research.google.com/github/Isso-W/Jiaozi/blob/codex/integration-update-colab/integration_update_colab.ipynb)
+
+For direct GPT-generated training on four Kaggle competitions and ten public
+image-classification datasets:
+
+[Open `vision_benchmarks_colab.ipynb` in Colab](https://colab.research.google.com/github/Isso-W/Jiaozi/blob/codex/integration-update-colab/vision_benchmarks_colab.ipynb)
+
+The benchmark notebook defaults to formal Cassava training: full data,
+EfficientNet-B3 at 300px, mixed precision, strong augmentation, class weights,
+cosine scheduling, per-epoch validation, early stopping, and resumable
+checkpoints in Google Drive.
+
 ## Pipeline
 
 The active integrated entry point is `pipeline.py`:
