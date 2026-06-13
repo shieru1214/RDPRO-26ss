@@ -488,12 +488,14 @@ def _model_utils_py() -> str:
             """Freeze backbone parameters based on finetune_strategy config."""
             config = config or {}
             strategy = str(get_value(config, "finetune_strategy", "head_only")).lower()
-            freeze = as_bool(
-                get_value(config, "freeze_backbone", strategy == "head_only"),
-                strategy == "head_only",
-            )
-            if strategy in ("full", "either"):
+            # head_only means "freeze backbone, train head" by definition — it must not be
+            # overridden by a stray freeze_backbone=false in the config.
+            if strategy == "head_only":
+                freeze = True
+            elif strategy in ("full", "either"):
                 freeze = False
+            else:
+                freeze = as_bool(get_value(config, "freeze_backbone", False), False)
 
             if freeze:
                 for param_name, param in model.named_parameters():

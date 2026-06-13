@@ -1607,7 +1607,7 @@ def build_task_list(result: dict, graph: nx.DiGraph, fmt: str = "structured") ->
             "id":              "train_strategy",
             "action":          "set_finetune_strategy",
             "strategy":        strategy,
-            "freeze_backbone": not freeze or strategy == "full",
+            "freeze_backbone": strategy == "head_only",
             "scratch_viable":  scratch,
         })
 
@@ -1685,7 +1685,7 @@ def build_task_list(result: dict, graph: nx.DiGraph, fmt: str = "structured") ->
             "loss":              loss_id,
             "optimizer":         optimizer_id,
             "finetune_strategy": strategy,
-            "freeze_backbone":   not freeze or strategy == "full",
+            "freeze_backbone":   strategy == "head_only",
             "scratch_viable":    scratch,
         })
 
