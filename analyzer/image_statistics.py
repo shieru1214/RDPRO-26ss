@@ -9,21 +9,8 @@ class ImageStatisticsAnalyzer:
 
         report = {}
 
-        report.update(
-            self._dataset_statistics(dataset)
-        )
-
-        report.update(
-            self._metadata_statistics(dataset)
-        )
-
-        report.update(
-            self._mode_distribution(dataset)
-        )
-
-        report.update(
-            self._format_distribution(dataset)
-        )
+        report.update(self._dataset_statistics(dataset))
+        report.update(self._image_metadata(dataset))
 
         return report
 
@@ -129,7 +116,9 @@ class ImageStatisticsAnalyzer:
         class_distribution = {}
 
         if fmt == "classification":
-            labels = [sample[info["column"]] for sample in label_split]
+            # Column access returns the label column directly WITHOUT decoding the
+            # image column — iterating rows would decode every image just to read labels.
+            labels = list(label_split[info["column"]])
             num_classes = len(set(labels))
             class_distribution = dict(Counter(labels))
 
@@ -142,8 +131,7 @@ class ImageStatisticsAnalyzer:
 
         elif fmt == "detection_flat":
             labels = []
-            for sample in label_split:
-                val = sample[info["column"]]
+            for val in label_split[info["column"]]:   # column access, no image decode
                 if isinstance(val, list):
                     labels.extend(val)
                 else:
@@ -165,63 +153,48 @@ class ImageStatisticsAnalyzer:
             "annotation_format": fmt,
         }
         
-    def _metadata_statistics(self, dataset):
+    def _image_metadata(self, dataset, sample_size=500):
+        """Image width/height + colour mode + format, in a single sampled pass.
 
-        widths = []
-        heights = []
+        Each image accessed via ``dataset[split][i]`` is fully decoded, so we do it
+        exactly once and on a random sample (these distributions don't need every
+        image). Replaces the old three full-decode passes.
+        """
+        import random
 
-        for split in dataset.keys():
-
-            for sample in dataset[split]:
-
-                image = sample["image"]
-
-                widths.append(image.width)
-
-                heights.append(image.height)
-
-        if not widths:
+        refs = [
+            (split_name, idx)
+            for split_name in dataset.keys()
+            for idx in range(len(dataset[split_name]))
+        ]
+        if not refs:
             return {
                 "min_width": 0, "max_width": 0, "avg_width": 0,
                 "min_height": 0, "max_height": 0, "avg_height": 0,
+                "mode_distribution": {}, "format_distribution": {},
+                "metadata_sample_size": 0,
             }
 
+        if len(refs) > sample_size:
+            refs = random.Random(0).sample(refs, sample_size)
+
+        widths, heights, modes, formats = [], [], [], []
+        for split_name, idx in refs:
+            image = dataset[split_name][idx]["image"]
+            widths.append(image.width)
+            heights.append(image.height)
+            modes.append(image.mode)
+            formats.append(str(image.format))
+
+        n = len(widths)
         return {
             "min_width": min(widths),
             "max_width": max(widths),
-            "avg_width": sum(widths)/len(widths),
+            "avg_width": sum(widths) / n,
             "min_height": min(heights),
             "max_height": max(heights),
-            "avg_height": sum(heights)/len(heights)
-        }
-            
-    def _mode_distribution(self, dataset):
-
-        modes = []
-        
-        for split in dataset.keys():
-
-            for sample in dataset[split]:
-                
-                modes.append(sample["image"].mode)
-            
-        return {
-            "mode_distribution": dict(Counter(modes))
-        }
-        
-    def _format_distribution(self, dataset):
-        
-        formats = []
-        
-        for split in dataset.keys():
-
-            for sample in dataset[split]:
-            
-                image = sample["image"]
-                
-                formats.append(str(image.format))
-            
-        return {
-            
-            "format_distribution": dict(Counter(formats))
+            "avg_height": sum(heights) / n,
+            "mode_distribution": dict(Counter(modes)),
+            "format_distribution": dict(Counter(formats)),
+            "metadata_sample_size": n,
         }

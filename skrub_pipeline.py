@@ -58,33 +58,17 @@ def dataset_statistics(loaded: dict) -> dict:
     return analyzer._dataset_statistics(loaded["dataset"])
 
 
-def metadata_statistics(loaded: dict) -> dict:
+def image_metadata(loaded: dict) -> dict:
     from analyzer.image_statistics import ImageStatisticsAnalyzer
 
     analyzer = ImageStatisticsAnalyzer()
-    return analyzer._metadata_statistics(loaded["dataset"])
+    return analyzer._image_metadata(loaded["dataset"])
 
 
-def mode_distribution(loaded: dict) -> dict:
-    from analyzer.image_statistics import ImageStatisticsAnalyzer
-
-    analyzer = ImageStatisticsAnalyzer()
-    return analyzer._mode_distribution(loaded["dataset"])
-
-
-def format_distribution(loaded: dict) -> dict:
-    from analyzer.image_statistics import ImageStatisticsAnalyzer
-
-    analyzer = ImageStatisticsAnalyzer()
-    return analyzer._format_distribution(loaded["dataset"])
-
-
-def merge_analysis(stats: dict, metadata: dict, mode: dict, fmt: dict) -> dict:
+def merge_analysis(stats: dict, metadata: dict) -> dict:
     report = {}
     report.update(stats)
     report.update(metadata)
-    report.update(mode)
-    report.update(fmt)
     return report
 
 
@@ -139,10 +123,8 @@ def build_pipeline(
     # Module 2 — dataset analysis (branching sub-graph)
     loaded = skrub.deferred(load_dataset)(ds_var, sub_var)
     stats = skrub.deferred(dataset_statistics)(loaded)
-    metadata = skrub.deferred(metadata_statistics)(loaded)
-    mode_dist = skrub.deferred(mode_distribution)(loaded)
-    fmt_dist = skrub.deferred(format_distribution)(loaded)
-    m2_report = skrub.deferred(merge_analysis)(stats, metadata, mode_dist, fmt_dist)
+    metadata = skrub.deferred(image_metadata)(loaded)
+    m2_report = skrub.deferred(merge_analysis)(stats, metadata)
 
     # Merge Module 1 + Module 2
     m3_input = skrub.deferred(merge_m1_m2)(m1_output, m2_report)
@@ -171,10 +153,8 @@ def build_module2_pipeline(
 
     loaded = skrub.deferred(load_dataset)(ds_var, sub_var)
     stats = skrub.deferred(dataset_statistics)(loaded)
-    metadata = skrub.deferred(metadata_statistics)(loaded)
-    mode_dist = skrub.deferred(mode_distribution)(loaded)
-    fmt_dist = skrub.deferred(format_distribution)(loaded)
-    m2_report = skrub.deferred(merge_analysis)(stats, metadata, mode_dist, fmt_dist)
+    metadata = skrub.deferred(image_metadata)(loaded)
+    m2_report = skrub.deferred(merge_analysis)(stats, metadata)
 
     return m2_report
 

@@ -17,11 +17,21 @@ from analyzer.image_statistics import ImageStatisticsAnalyzer
 
 
 def _make_split(rows, columns):
-    """构造一个行为类似 HuggingFace Dataset split 的 mock 对象。"""
+    """构造一个行为类似 HuggingFace Dataset split 的 mock 对象。
+
+    支持两种索引（与真实 HF Dataset 一致）：
+      - 整数 idx → 返回整行 dict
+      - 字符串 col → 返回该列的列表（不触碰其它列，模拟列访问不解码图像）
+    """
+    def _getitem(_self, key):
+        if isinstance(key, str):
+            return [row.get(key) for row in rows]
+        return rows[key]
+
     split = MagicMock()
     split.column_names = columns
     split.__len__ = lambda self: len(rows)
-    split.__getitem__ = lambda self, idx: rows[idx]
+    split.__getitem__ = _getitem
     split.__iter__ = lambda self: iter(rows)
     return split
 
