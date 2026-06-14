@@ -86,11 +86,58 @@ Stand up a harness that runs "Module 3 pick → train → compare to baseline" s
 to selection or the recipe is judged by **real scores**, not hand-tuning. Do this early so
 §1–§5 are data-driven.
 
+## 7. Beyond rules: data-driven ranking & ensembles (Phase 3+)
+
+Hand-written rules hit a hard ceiling for two things: **ranking in-budget candidates by
+expected accuracy**, and **ensembles** (which need to reason about *complementary* errors, a
+combinatorial/data problem rules can't express). The fix is to split selection into stages
+and make ranking signal-driven, not rule-driven:
+
+```
+A  Candidate generation:  KB + rules + budget filter   → shortlist of viable configs
+                          (rules belong HERE only — pruning the search space; extensible via KB)
+B  Ranking signal:        a point on the cost/accuracy spectrum below (dataset-specific)
+C  Compute allocation:    multi-fidelity (Hyperband / successive halving)
+D  Output:                greedy ensemble selection over survivors (not "pick top-1")
+```
+
+### The ranking-signal spectrum (B)
+
+Pick/combine points by available compute — it is **not** one method:
+
+| Cost | Signal | Gives |
+|---|---|---|
+| **0 (no run)** | public-benchmark predictor / **LLM-as-prior ranker** / kNN to similar datasets (dataset2vec) | cold-start prior, broad but black-box |
+| **~0 (forward only)** | **transferability metrics (LogME / LEEP / SFDA)** ⭐ | a score predicting *finetuned* ranking from frozen features — cheaper than a probe and predicts finetuning, not just frozen accuracy |
+| **cheap** | frozen-feature **linear probe** (reuses our feature cache) | dataset-specific accuracy proxy |
+| **mid** | **1-epoch screen + successive halving** | kill weak candidates, give compute to survivors |
+| **full** | real training (the harness) | ground truth — for **calibration**, not the bottleneck |
+
+### Key reframes
+
+- **transferability metrics (LogME)** beat a plain linear probe: nearly free, and purpose-built
+  to rank source models for a target without finetuning. Best starting point for B.
+- **multi-fidelity** (Hyperband) is the principled way to spend a fixed budget across
+  candidates — the bridge between cheap proxy and real training; turns the harness from "run
+  everything" into "allocate smartly".
+- **ensembles as the strategy, not an afterthought**: cheaply screen a small portfolio, keep
+  3–4 survivors, greedily combine complementary ones. "Selection" becomes "allocate compute +
+  combine" — exactly what wins Kaggle, and zero hardcoded rules.
+- The homegrown **harness is demoted** from foundation to a calibration/validation tool; the
+  probe/LogME signal is dataset-specific and needs no cold-start data collection.
+
+### Recommended starting point
+
+A **LogME (or linear-probe) ranker** over the in-budget candidates, reusing the existing
+frozen-feature cache: rank B by a cheap dataset-specific signal instead of heuristics. Then
+layer multi-fidelity (C) and greedy ensemble (D) on top. Rules stay confined to A.
+
 ## Suggested order
 
 1. Wire unused signals (esp. Module 2 image stats → image_size) + cost-aware tiebreak.
 2. Recipe layer v0 (image_size + lr).
-3. Catalog eval harness (in parallel, so 1–2 are measurable).
+3. Catalog eval harness (in parallel, so 1–2 are measurable) — now a calibration tool (§7).
+4. Phase 3 ranker: LogME/linear-probe over in-budget candidates (§7 B), then multi-fidelity + ensemble.
 
 ## Status
 
