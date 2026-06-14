@@ -122,5 +122,56 @@ class TestPipelineGlue(unittest.TestCase):
             self.assertIn("rank_basis", r)
 
 
+class TestOutcomeLogging(unittest.TestCase):
+    def test_log_from_summary(self):
+        from recommender.ranker import log_from_summary
+
+        m2 = {"num_classes": 5, "total_images": 9000, "avg_width": 600, "avg_height": 800,
+              "mode_distribution": {"RGB": 9000}}
+        m3 = {"task_type": "classification", "data_size": "medium", "constraints": {}}
+        summary = {
+            "status": "success",
+            "config": {"backbone": "efficientnet"},
+            "evaluate": {"metric_name": "accuracy", "metric_value": 0.83, "macro_f1": 0.79, "status": "success"},
+            "train": {"loss": 0.4},
+        }
+        mem = OutcomeMemory(Path(tempfile.mkdtemp()) / "m.jsonl")
+        fp = log_from_summary(summary, m2, m3, config={"backbone": "efficientnet", "params_M": 5},
+                              dataset_id="cassava", memory=mem)
+        self.assertIsNotNone(fp)
+        records = mem.all()
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["result"]["metric_value"], 0.83)
+        self.assertEqual(records[0]["config"]["backbone"], "efficientnet")
+        self.assertEqual(records[0]["dataset_id"], "cassava")
+
+    def test_log_from_summary_skips_missing_metric(self):
+        from recommender.ranker import log_from_summary
+
+        mem = OutcomeMemory(Path(tempfile.mkdtemp()) / "m.jsonl")
+        out = log_from_summary({"evaluate": {"metric_value": None}}, {}, {}, memory=mem)
+        self.assertIsNone(out)
+        self.assertEqual(mem.all(), [])
+
+
+class TestSummaryParsing(unittest.TestCase):
+    def test_extract_last_json(self):
+        from run_and_log import extract_last_json
+
+        text = (
+            "[train] epoch 1/3 loss=0.5\n"
+            "[train] Done.\n"
+            '{\n  "status": "success",\n  "evaluate": {"metric_value": 0.81}\n}\n'
+        )
+        obj = extract_last_json(text)
+        self.assertEqual(obj["status"], "success")
+        self.assertEqual(obj["evaluate"]["metric_value"], 0.81)
+
+    def test_extract_last_json_none_when_absent(self):
+        from run_and_log import extract_last_json
+
+        self.assertIsNone(extract_last_json("just logs, no json here"))
+
+
 if __name__ == "__main__":
     unittest.main()

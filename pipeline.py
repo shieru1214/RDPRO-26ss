@@ -332,6 +332,7 @@ def run_pipeline(
 
     return {
         "module3_input":   m3_input,
+        "m2_report":        m2_report,        # for the recommender fingerprint / outcome logging
         "recommendations": recommendations,
         "task_lists":       task_lists,
         "module4":          module4_result,

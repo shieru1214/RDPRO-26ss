@@ -127,3 +127,31 @@ def log_run(
     mem = memory if memory is not None else OutcomeMemory()
     mem.log(fingerprint, config, result, dataset_id=dataset_id)
     return fingerprint
+
+
+def log_from_summary(
+    summary: dict,
+    m2_report: dict,
+    m3_input: dict,
+    config: dict | None = None,
+    dataset_id: str | None = None,
+    memory=None,
+) -> dict | None:
+    """Log an outcome from a generated run.py summary (the {train, evaluate, infer} dict).
+
+    `config` (the project's flattened configs.json) is preferred for the logged config —
+    it carries backbone / checkpoint / params; otherwise the summary's compact config is
+    used. Returns the logged fingerprint, or None if there's no usable metric.
+    """
+    evaluate = summary.get("evaluate", {}) or {}
+    if evaluate.get("metric_value") is None:
+        return None
+
+    logged_config = dict(config) if config else dict(summary.get("config", {}))
+    result = {
+        "metric_name": evaluate.get("metric_name", "accuracy"),
+        "metric_value": evaluate.get("metric_value"),
+        "macro_f1": evaluate.get("macro_f1"),
+        "status": evaluate.get("status", summary.get("status")),
+    }
+    return log_run(m2_report, m3_input, logged_config, result, dataset_id=dataset_id, memory=memory)
