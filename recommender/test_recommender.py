@@ -210,5 +210,28 @@ class TestCostMeter(unittest.TestCase):
         self.assertEqual(mem.all()[0]["cost"]["llm_tokens"], 250)
 
 
+class TestReport(unittest.TestCase):
+    def test_summarize_pulls_quality_and_cost(self):
+        from recommender.report import summarize, format_table
+
+        records = [{
+            "dataset_id": "cassava",
+            "config": {"backbone": "efficientnet"},
+            "result": {"metric_name": "accuracy", "metric_value": 0.83},
+            "cost": {"llm_tokens": 1240, "llm_calls": 1, "epochs": 12, "wall_clock_sec": 540.2},
+        }]
+        rows = summarize(records)
+        self.assertEqual(rows[0]["backbone"], "efficientnet")
+        self.assertEqual(rows[0]["metric"], 0.83)
+        self.assertEqual(rows[0]["tokens"], 1240)
+        table = format_table(rows)
+        self.assertIn("efficientnet", table)
+        self.assertIn("cassava", table)
+
+    def test_empty_report(self):
+        from recommender.report import summarize, format_table
+        self.assertEqual(format_table(summarize([])), "(no outcomes logged yet)")
+
+
 if __name__ == "__main__":
     unittest.main()
