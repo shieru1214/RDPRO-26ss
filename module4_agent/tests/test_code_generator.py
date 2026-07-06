@@ -1,5 +1,7 @@
 import json
 
+import pytest
+
 from module4_agent.code_generator import REQUIRED_GENERATED_FILES, generate_files
 from module4_agent.spec_builder import build_training_specs
 
@@ -23,6 +25,40 @@ def _specs():
                     "backbone": "dinov2_vits14",
                     "loss": "feature_mse_loss",
                     "optimizer": "adamw",
+                },
+            },
+        ]
+    )
+
+
+def _recipe_specs():
+    return build_training_specs(
+        [
+            {
+                "rank": 1,
+                "model_config": {
+                    "task_type": "classification",
+                    "backbone": "efficientnet_b0",
+                    "loss": "cross_entropy_loss",
+                    "optimizer": "adamw",
+                    "recipe": {
+                        "image_size": 384,
+                        "learning_rate": 1.0e-4,
+                        "epochs": 20,
+                        "augmentation": {
+                            "tier": "medium",
+                            "invariance": {
+                                "hflip": True,
+                                "vflip": False,
+                                "rot90": False,
+                                "color": False,
+                                "crop_scale_min": 0.75,
+                                "randaugment": False,
+                                "random_erasing": False,
+                            },
+                            "schedule": "taper_last_20pct",
+                        },
+                    },
                 },
             },
         ]
@@ -254,3 +290,54 @@ def test_generated_readme_documents_runtime_files():
     assert "Smoke vs Real Training" in readme
     assert "Current Limitations" in readme
     assert "checkpoint" in readme.lower()
+
+
+def test_generated_utils_falls_back_to_recipe_values(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+    import importlib
+    import sys
+
+    generated = generate_files(_recipe_specs(), llm_provider="none")
+    (tmp_path / "utils.py").write_text(generated.files["utils.py"], encoding="utf-8")
+    monkeypatch.syspath_prepend(str(tmp_path))
+    sys.modules.pop("utils", None)
+    try:
+        utils = importlib.import_module("utils")
+
+        config = {"recipe": {"image_size": 384, "learning_rate": 1.0e-4, "epochs": 20}}
+        assert utils.get_value(config, "image_size", 224) == 384
+        assert utils.get_value(config, "learning_rate", 1.0e-3) == 1.0e-4
+        assert utils.get_recipe_value(config, "epochs", 10) == 20
+        assert utils.get_value({**config, "image_size": 128}, "image_size", 224) == 128
+    finally:
+        sys.modules.pop("utils", None)
+
+
+def test_recipe_dict_augmentation_builds_train_transform(tmp_path, monkeypatch):
+    pytest.importorskip("torch")
+    pytest.importorskip("torchvision")
+    from PIL import Image
+    import importlib
+    import os
+    import sys
+
+    env_snapshot = dict(os.environ)
+    generated = generate_files(_recipe_specs(), llm_provider="none")
+    for name, content in generated.files.items():
+        (tmp_path / name).write_text(content, encoding="utf-8")
+
+    monkeypatch.syspath_prepend(str(tmp_path))
+    for mod in ("train", "model", "smoke_data", "utils"):
+        sys.modules.pop(mod, None)
+    try:
+        train = importlib.import_module("train")
+        config = json.loads(generated.files["configs.json"])[0]
+        transform = train._build_image_transform(config, "train")
+        tensor = transform(Image.new("RGB", (512, 512), "white"))
+
+        assert tuple(tensor.shape[-2:]) == (384, 384)
+    finally:
+        for mod in ("train", "model", "smoke_data", "utils"):
+            sys.modules.pop(mod, None)
+        os.environ.clear()
+        os.environ.update(env_snapshot)

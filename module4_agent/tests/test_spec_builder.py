@@ -123,6 +123,60 @@ def test_model_config_wins_when_tasks_conflict():
     assert spec.optimizer == "adamw"
 
 
+def test_recipe_defaults_populate_training_spec_when_top_level_missing():
+    augmentation = {
+        "tier": "medium",
+        "invariance": {"hflip": True, "color": False, "crop_scale_min": 0.75},
+        "schedule": "taper_last_20pct",
+    }
+    spec = build_training_specs([
+        {
+            "model_config": {
+                "task_type": "classification",
+                "backbone": "efficientnet_b0",
+                "loss": "cross_entropy_loss",
+                "optimizer": "adamw",
+                "recipe": {
+                    "image_size": 384,
+                    "learning_rate": 1.0e-4,
+                    "epochs": 20,
+                    "augmentation": augmentation,
+                },
+            },
+        }
+    ])[0]
+
+    assert spec.image_size == 384
+    assert spec.learning_rate == 1.0e-4
+    assert spec.augmentation == augmentation
+    assert spec.to_config()["model_config"]["recipe"]["epochs"] == 20
+
+
+def test_explicit_top_level_values_win_over_recipe_defaults():
+    spec = build_training_specs([
+        {
+            "model_config": {
+                "task_type": "classification",
+                "backbone": "efficientnet_b0",
+                "loss": "cross_entropy_loss",
+                "optimizer": "adamw",
+                "image_size": 128,
+                "learning_rate": 3.0e-4,
+                "augmentation": "stronger",
+                "recipe": {
+                    "image_size": 384,
+                    "learning_rate": 1.0e-4,
+                    "augmentation": {"tier": "medium"},
+                },
+            },
+        }
+    ])[0]
+
+    assert spec.image_size == 128
+    assert spec.learning_rate == 3.0e-4
+    assert spec.augmentation == "stronger"
+
+
 def test_unknown_task_type_falls_back_safely():
     spec = build_training_specs([{"model_config": {"task_type": "not_real", "backbone": "custom"}}])[0]
 

@@ -11,6 +11,7 @@ colab_demo_output/
 chroma_db_kb/
 test_runs/
 CLAUDE.local.md
+.claude/
 workspace/
 .DS_Store
 .pytest_cache/

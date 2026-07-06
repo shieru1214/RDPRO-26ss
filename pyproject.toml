@@ -33,9 +33,11 @@ dev = [
 [tool.setuptools.packages.find]
 include = [
   "analyzer*",
+  "experiments*",
   "features*",
   "ingestion*",
   "module4_agent*",
   "processors*",
+  "recipe*",
   "retrieval*",
 ]

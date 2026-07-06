@@ -1281,16 +1281,32 @@ def _select_components(
         chosen = candidates[0]  # default: 第一个兼容项
 
         if ctype == "loss":
-            # 类别不平衡 → 优先 focal_loss
-            if c.get("class_imbalance") and "focal_loss" in candidates:
+            # Phase B：preferred_when 边消费（候选间两两偏好，条件匹配则胜者上位）。
+            # backbone 打分只用边的源+条件；此处是候选内选择，目标有意义。
+            # candidates 顺序即遍历顺序，首个命中者胜（与 candidates[0] 的确定性一致）。
+            edge_pick = None
+            for cand in candidates:
+                for succ in graph.successors(cand):
+                    e = graph[cand][succ]
+                    if (e.get("relation") == "preferred_when"
+                            and succ in candidates
+                            and _matches_condition(e.get("condition", {}), input_json)):
+                        edge_pick = cand
+                        break
+                if edge_pick:
+                    break
+
+            if edge_pick is not None:
+                chosen = edge_pick
+            # 以下硬编码规则作为 fallback 保留：覆盖边尚未表达的情形（bce_dice、
+            # hungarian）；等挖掘产出的边补齐后再另行清理。
+            elif c.get("class_imbalance") and "focal_loss" in candidates:
                 chosen = "focal_loss"
-            # 分割任务 → 优先 dice_loss，二值场景用 bce_dice
             elif task_type == "image_segmentation":
                 if c.get("class_imbalance") and "bce_dice_loss" in candidates:
                     chosen = "bce_dice_loss"
                 elif "dice_loss" in candidates:
                     chosen = "dice_loss"
-            # DETR 系 → hungarian_matching_loss
             elif backbone_id in ("detr", "rt_detr") and "hungarian_matching_loss" in candidates:
                 chosen = "hungarian_matching_loss"
 
@@ -1685,7 +1701,57 @@ def retrieve_top3_hybrid(
 # 6. Module 4 接口 — 任务清单生成
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def build_task_list(result: dict, graph: nx.DiGraph, fmt: str = "structured") -> dict:
+def _node_facts(graph: nx.DiGraph, node_id: str | None) -> dict | None:
+    if not node_id or node_id not in graph:
+        return None
+    return {"id": node_id, **dict(graph.nodes[node_id])}
+
+
+def _infer_result_task_type(
+    graph: nx.DiGraph,
+    head_id: str | None,
+    loss_id: str | None,
+    input_json: dict | None,
+) -> str:
+    if input_json and input_json.get("task_type"):
+        return input_json["task_type"]
+    for node_id in (head_id, loss_id):
+        if node_id and node_id in graph:
+            task_types = graph.nodes[node_id].get("task_type", [])
+            if task_types:
+                return task_types[0]
+    return "classification"
+
+
+def _attach_recipe(
+    model_config: dict,
+    input_json: dict,
+    graph: nx.DiGraph,
+    backbone_id: str,
+    checkpoint_id: str | None,
+    data_stats: dict | None,
+) -> None:
+    try:
+        from recipe.layer import build_recipe
+    except Exception:
+        return
+    facts = {
+        "backbone": _node_facts(graph, backbone_id),
+        "checkpoint": _node_facts(graph, checkpoint_id),
+    }
+    recipe, provenance = build_recipe(model_config, input_json, facts, data_stats=data_stats)
+    if recipe:
+        model_config.setdefault("recipe", recipe)
+        model_config.setdefault("recipe_provenance", provenance)
+
+
+def build_task_list(
+    result: dict,
+    graph: nx.DiGraph,
+    fmt: str = "structured",
+    input_json: dict | None = None,
+    data_stats: dict | None = None,
+) -> dict:
     """
     将单条 retrieve_top3_hybrid 结果转换为 Module 4 可消费的任务清单。
 
@@ -1704,6 +1770,8 @@ def build_task_list(result: dict, graph: nx.DiGraph, fmt: str = "structured") ->
 
     def _name(nid):
         return graph.nodes[nid]["name"] if nid else None
+
+    inferred_task_type = _infer_result_task_type(graph, head_id, loss_id, input_json)
 
     if fmt == "structured":
         tasks = []
@@ -1793,15 +1861,26 @@ def build_task_list(result: dict, graph: nx.DiGraph, fmt: str = "structured") ->
         if optimizer_id:
             nl_tasks.append(f"Use {_name(optimizer_id)} as the optimizer")
 
-        model_config: dict = {"backbone": backbone_id}
+        model_config: dict = {
+            "task_type": inferred_task_type,
+            "backbone": backbone_id,
+            "data_size": (input_json or {}).get("data_size", "medium"),
+        }
+        constraints = (input_json or {}).get("constraints", {})
+        if isinstance(constraints, dict):
+            model_config["class_imbalance"] = bool(constraints.get("class_imbalance", False))
         if checkpoint_id:
             cp = graph.nodes[checkpoint_id]
             model_config.update({
+                "checkpoint":          checkpoint_id,
                 "pretrained_hf_id":   cp["hf_id"],
                 "pretrained_name":    cp["name"],
                 "pretrain_dataset":   cp["pretrain_dataset"],
                 "params_M":           cp["params_M"],
+                "use_pretrained":      True,
             })
+        else:
+            model_config["use_pretrained"] = False
         model_config.update({
             "head":              head_id,
             "loss":              loss_id,
@@ -1810,6 +1889,14 @@ def build_task_list(result: dict, graph: nx.DiGraph, fmt: str = "structured") ->
             "freeze_backbone":   strategy == "head_only",
             "scratch_viable":    scratch,
         })
+        recipe_input = dict(input_json or {})
+        recipe_input.setdefault("task_type", inferred_task_type)
+        recipe_input.setdefault("data_size", model_config.get("data_size", "medium"))
+        recipe_input.setdefault("priority", "balanced")
+        recipe_input.setdefault("constraints", constraints if isinstance(constraints, dict) else {})
+        if data_stats is None:
+            data_stats = recipe_input.get("data_stats")
+        _attach_recipe(model_config, recipe_input, graph, backbone_id, checkpoint_id, data_stats)
 
         return {
             "format":       "nl",
@@ -1826,11 +1913,13 @@ def build_all_task_lists(
     results: list[dict],
     graph: nx.DiGraph,
     fmt: str = "structured",
+    input_json: dict | None = None,
+    data_stats: dict | None = None,
 ) -> list[dict]:
     """Top 3 结果全部转换为任务清单，rank 字段标注排名。"""
     out = []
     for rank, result in enumerate(results, 1):
-        tl = build_task_list(result, graph, fmt=fmt)
+        tl = build_task_list(result, graph, fmt=fmt, input_json=input_json, data_stats=data_stats)
         tl["rank"]  = rank
         tl["score"] = result.get("score")
         out.append(tl)

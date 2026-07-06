@@ -13,7 +13,15 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from pipeline import derive_data_size, derive_class_imbalance, merge_modules, run_module4_generation, parse_dataset_id
+from pipeline import (
+    derive_class_imbalance,
+    derive_color_mode,
+    derive_data_size,
+    derive_resolution_tier,
+    merge_modules,
+    parse_dataset_id,
+    run_module4_generation,
+)
 from features_extraction_api import parse_module1_output
 from env_loader import load_env_file
 
@@ -132,6 +140,23 @@ class TestDeriveClassImbalance(unittest.TestCase):
         self.assertFalse(derive_class_imbalance({}))
 
 
+class TestDeriveDataStats(unittest.TestCase):
+
+    def test_resolution_tiers(self):
+        self.assertEqual(derive_resolution_tier({"avg_width": 128, "avg_height": 200}), "low")
+        self.assertEqual(derive_resolution_tier({"avg_width": 512, "avg_height": 384}), "medium")
+        self.assertEqual(derive_resolution_tier({"avg_width": 1200, "avg_height": 768}), "high")
+
+    def test_resolution_missing_or_invalid_defaults_medium(self):
+        self.assertEqual(derive_resolution_tier({}), "medium")
+        self.assertEqual(derive_resolution_tier({"avg_width": "bad", "avg_height": 768}), "medium")
+
+    def test_color_mode_uses_dominant_mode(self):
+        self.assertEqual(derive_color_mode({"mode_distribution": {"L": 90, "RGB": 10}}), "grayscale")
+        self.assertEqual(derive_color_mode({"mode_distribution": {"RGB": 90, "L": 10}}), "rgb")
+        self.assertEqual(derive_color_mode({}), "rgb")
+
+
 class TestMergeModules(unittest.TestCase):
 
     def _make_m1(self, **overrides):
@@ -211,6 +236,24 @@ class TestMergeModules(unittest.TestCase):
         m2 = {"total_images": 5000, "class_distribution": {}}
         merged = merge_modules(m1, m2)
         self.assertNotIn("num_classes", merged)
+
+    def test_data_stats_passed_through_for_recipe_layer(self):
+        m1 = self._make_m1()
+        m2 = self._make_m2()
+        m2.update({
+            "avg_width": 1200,
+            "avg_height": 800,
+            "mode_distribution": {"L": 100, "RGB": 1},
+            "format_distribution": {"PNG": 101},
+        })
+
+        merged = merge_modules(m1, m2)
+
+        self.assertEqual(merged["data_stats"]["resolution_tier"], "high")
+        self.assertEqual(merged["data_stats"]["color_mode"], "grayscale")
+        self.assertEqual(merged["data_stats"]["avg_width"], 1200)
+        self.assertEqual(merged["data_stats"]["mode_distribution"], {"L": 100, "RGB": 1})
+        self.assertEqual(merged["data_stats"]["format_distribution"], {"PNG": 101})
 
     def test_data_size_uses_per_class_signal(self):
         """合并时 data_size 应考虑类别数：25k 张 200 类 → medium 而非 large"""

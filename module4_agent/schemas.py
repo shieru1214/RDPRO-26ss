@@ -56,7 +56,7 @@ class TrainingSpec:
     tasks: list[Any] = field(default_factory=list)
     alternatives: list[Any] = field(default_factory=list)
     learning_rate: float = 1.0e-3
-    augmentation: str = "basic"
+    augmentation: Any = "basic"
     data_size: str = "medium"
     class_imbalance: bool = False
     checkpoint: str = ""

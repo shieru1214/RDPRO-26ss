@@ -27,13 +27,17 @@ The active integrated entry point is `pipeline.py`:
 ```text
 User request + HuggingFace dataset id
 -> Module 1: parse task type, priority, and constraints with an LLM
--> Module 2: analyze dataset size, classes, and class imbalance
+-> Module 2: analyze dataset size, classes, class imbalance, and image stats
 -> Module 3: retrieve up to three ranked CV model configurations
+-> Recipe layer: attach model/data-aware defaults for image size, LR, epochs, augmentation
 -> Module 4: generate training/evaluation/inference code
 -> Local smoke test + deterministic review
 ```
 
-The active Module 4 implementation is `module4_agent/`.
+The active Module 4 implementation is `module4_agent/`. The deterministic
+recipe layer lives in `recipe/` and is attached during natural-language Module 3
+retrieval for classification tasks, then consumed by Module 4 unless the input
+configuration explicitly overrides a field.
 
 ## Environment
 
@@ -167,6 +171,43 @@ Module 4 pytest suite:
 /usr/bin/python3 -m pytest module4_agent/tests -q
 ```
 
+Recipe and loss-imbalance A/B logic:
+
+```bash
+/usr/bin/python3 -m pytest recipe/tests experiments/ab_loss_imbalance/tests \
+  module4_agent/tests/test_fold_injection.py -q
+```
+
+Broad local regression check used during the latest integration pass:
+
+```bash
+PYTHONPYCACHEPREFIX=/private/tmp/jiaozi-pycache \
+PYTEST_ADDOPTS='-p no:cacheprovider' \
+PYTHONPATH=.:retrieval \
+/usr/bin/python3 -m pytest --ignore=ingestion/test_dataset.py -q
+```
+
+The full `pytest` collection currently requires the optional `datasets` package
+for `ingestion/test_dataset.py`; without it, collection stops before the rest of
+the suite runs.
+
+## Loss-Imbalance A/B Harness
+
+`experiments/ab_loss_imbalance/` contains a pre-registered CE-vs-focal loss
+experiment for class-imbalance cases. It freezes all non-loss factors, uses
+paired stratified 5-fold splits shared across both arms, exports validation
+predictions from generated Module 4 projects, and summarizes outcomes with a
+conservative paired verdict.
+
+```bash
+/usr/bin/python3 -m experiments.ab_loss_imbalance.run_ab --testbed cassava \
+  --data-root ./kaggle_data --output ./ab_runs
+/usr/bin/python3 -m experiments.ab_loss_imbalance.collect
+```
+
+The harness and offline tests are in place; real Kaggle/GPU runs are still
+needed before changing the recommendation KB default for imbalance.
+
 ## Current Scope
 
 - Local smoke tests use synthetic data and do not perform long training.
@@ -174,7 +215,11 @@ Module 4 pytest suite:
   HuggingFace checkpoints.
 - Real checkpoint loading is available in generated code when
   `offline_smoke=false` and `use_pretrained=true`.
+- Recipe v0 is deterministic and currently targets classification; unsupported
+  task types receive an empty recipe so existing smoke paths stay unchanged.
 - Object detection and segmentation metrics are smoke-compatible placeholders,
   not real benchmark scores.
+- Loss-imbalance A/B infrastructure is implemented, but the actual benchmark
+  verdict is pending real training results.
 - The project uses a lightweight workflow agent design rather than a heavy
   external agent framework such as LangGraph or AutoGen.

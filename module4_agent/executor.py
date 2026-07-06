@@ -34,7 +34,7 @@ def subprocess_env() -> dict[str, str]:
 
     env = os.environ.copy()
     for key, value in SUBPROCESS_ENV_DEFAULTS.items():
-        env.setdefault(key, value)
+        env[key] = value
     return env
 
 

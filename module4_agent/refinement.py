@@ -91,7 +91,7 @@ def _proxy_score(spec: TrainingSpec, *, seed: int, smoke_loss: float | None = No
     optimizer = spec.optimizer.lower()
     loss = spec.loss.lower()
     strategy = spec.finetune_strategy.lower()
-    augmentation = spec.augmentation.lower()
+    augmentation = str(spec.augmentation or "").lower()
     data_size = spec.data_size.lower()
 
     if spec.task_type == "classification":

@@ -70,6 +70,7 @@ def build_training_specs(candidates: Sequence[Mapping[str, Any]]) -> list[Traini
         model_config = dict(candidate.get("model_config") or {})
         task_overrides = _extract_structured_task_fields(candidate.get("tasks"))
         merged = {**task_overrides, **model_config}
+        recipe = merged.get("recipe") if isinstance(merged.get("recipe"), Mapping) else {}
 
         task_type = _normalize_task_type(
             merged.get("task_type")
@@ -153,14 +154,19 @@ def build_training_specs(candidates: Sequence[Mapping[str, Any]]) -> list[Traini
             tasks=list(candidate.get("tasks") or []),
             alternatives=list(candidate.get("alternatives") or []),
             learning_rate=_safe_float(
-                merged.get("learning_rate") or merged.get("lr"),
+                _first_present(
+                    merged.get("learning_rate"),
+                    merged.get("lr"),
+                    recipe.get("learning_rate"),
+                ),
                 default=1.0e-3,
             ),
-            augmentation=str(
-                merged.get("augmentation")
-                or constraints.get("augmentation")
-                or candidate.get("augmentation")
-                or "basic"
+            augmentation=_first_present(
+                merged.get("augmentation"),
+                constraints.get("augmentation"),
+                candidate.get("augmentation"),
+                recipe.get("augmentation"),
+                "basic",
             ),
             data_size=str(
                 merged.get("data_size")
@@ -176,9 +182,12 @@ def build_training_specs(candidates: Sequence[Mapping[str, Any]]) -> list[Traini
             ),
             embedding_dim=_safe_int(merged.get("embedding_dim"), default=32),
             image_size=_safe_int(
-                merged.get("image_size")
-                or merged.get("input_size")
-                or candidate.get("default_input_size"),
+                _first_present(
+                    merged.get("image_size"),
+                    merged.get("input_size"),
+                    recipe.get("image_size"),
+                    candidate.get("default_input_size"),
+                ),
                 default=224,
             ),
             offline_smoke=_safe_bool(merged.get("offline_smoke"), default=True),
@@ -194,6 +203,13 @@ def build_training_specs(candidates: Sequence[Mapping[str, Any]]) -> list[Traini
         )
         specs.append(spec)
     return specs
+
+
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value is not None:
+            return value
+    return None
 
 
 def specs_to_configs(specs: Sequence[TrainingSpec]) -> list[dict[str, Any]]:

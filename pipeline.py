@@ -18,6 +18,8 @@ import json
 import sys
 from pathlib import Path
 
+from recipe.tables import derive_recommended_epochs
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Module 2 → Module 3 字段映射
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -68,34 +70,6 @@ def derive_data_size(
     return by_total
 
 
-_RECOMMENDED_EPOCHS = {
-    ("small",  "head_only"): 25,
-    ("small",  "finetune"):  40,
-    ("small",  "scratch"):   50,
-    ("medium", "head_only"): 12,
-    ("medium", "finetune"):  20,
-    ("medium", "scratch"):   30,
-    ("large",  "head_only"):  8,
-    ("large",  "finetune"):  15,
-    ("large",  "scratch"):   20,
-}
-
-
-def derive_recommended_epochs(
-    data_size: str,
-    finetune_strategy: str | None,
-    use_pretrained: bool,
-) -> int:
-    """Recommend training epochs based on data size and training mode."""
-    if not use_pretrained:
-        mode = "scratch"
-    elif finetune_strategy == "head_only":
-        mode = "head_only"
-    else:
-        mode = "finetune"
-    return _RECOMMENDED_EPOCHS.get((data_size, mode), 15)
-
-
 _IMBALANCE_RATIO_THRESHOLD = 10
 
 def derive_class_imbalance(class_distribution: dict) -> bool:
@@ -107,6 +81,32 @@ def derive_class_imbalance(class_distribution: dict) -> bool:
     if min_count == 0:
         return True
     return max(counts) / min_count > _IMBALANCE_RATIO_THRESHOLD
+
+
+def derive_resolution_tier(stats: dict) -> str:
+    """Derive low/medium/high from the average short side in Module 2 metadata."""
+    try:
+        avg_w = float(stats.get("avg_width", 0) or 0)
+        avg_h = float(stats.get("avg_height", 0) or 0)
+    except (TypeError, ValueError):
+        return "medium"
+    short_side = min(v for v in (avg_w, avg_h) if v > 0) if (avg_w > 0 or avg_h > 0) else 0
+    if short_side <= 0:
+        return "medium"
+    if short_side < 256:
+        return "low"
+    if short_side >= 768:
+        return "high"
+    return "medium"
+
+
+def derive_color_mode(stats: dict) -> str:
+    """Derive rgb/grayscale from the dominant PIL mode in Module 2 metadata."""
+    dist = stats.get("mode_distribution") or {}
+    if not isinstance(dist, dict) or not dist:
+        return "rgb"
+    dominant = max(dist, key=dist.get)
+    return "grayscale" if str(dominant).upper() in {"L", "1", "LA"} else "rgb"
 
 
 def _patch_torch_metadata():
@@ -178,6 +178,15 @@ def merge_modules(m1_output: dict, m2_report: dict) -> dict:
     )
     if num_classes:
         merged["num_classes"] = num_classes
+
+    merged["data_stats"] = {
+        "resolution_tier": derive_resolution_tier(m2_report),
+        "color_mode": derive_color_mode(m2_report),
+        "avg_width": m2_report.get("avg_width"),
+        "avg_height": m2_report.get("avg_height"),
+        "mode_distribution": m2_report.get("mode_distribution", {}),
+        "format_distribution": m2_report.get("format_distribution", {}),
+    }
 
     # class_imbalance: Module 1（用户说了）或 Module 2（数据显示了）任一为 True 即生效
     m2_imbalance = derive_class_imbalance(class_dist)
@@ -298,14 +307,26 @@ def run_pipeline(
         for r in recommendations:
             print(f"    [{r.get('rank_basis')}] {r.get('backbone')} — {r.get('explanation')}")
 
-    task_lists = build_all_task_lists(recommendations, G, fmt=fmt)
+    task_lists = build_all_task_lists(
+        recommendations,
+        G,
+        fmt=fmt,
+        input_json=m3_input,
+        data_stats=m3_input.get("data_stats"),
+    )
     module4_result = None
 
     if module4_output:
         print(f"[Pipeline] Module 4: Generating code to {module4_output}...")
         module4_task_lists = task_lists
         if fmt != "nl":
-            module4_task_lists = build_all_task_lists(recommendations, G, fmt="nl")
+            module4_task_lists = build_all_task_lists(
+                recommendations,
+                G,
+                fmt="nl",
+                input_json=m3_input,
+                data_stats=m3_input.get("data_stats"),
+            )
         num_classes = m3_input.get("num_classes")
         for task_list in module4_task_lists:
             mc = task_list.get("model_config")
@@ -323,9 +344,9 @@ def run_pipeline(
                     mc.get("finetune_strategy"),
                     bool(mc.get("pretrained_hf_id")),
                 ))
-                # Recipe layer: recommended training hyperparameters (lr / image_size /
-                # augmentation / early stopping). setdefault → KB/user-set values win.
-                if use_recipe:
+                # Legacy opt-in fallback: recipe is now produced by Module 3. Keep the
+                # old recommender.recipe path only for task lists produced elsewhere.
+                if use_recipe and "recipe" not in mc:
                     from recommender.recipe import recommend_recipe
                     hp = recommend_recipe(
                         backbone=mc.get("backbone"),

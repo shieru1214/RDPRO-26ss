@@ -124,9 +124,19 @@ def _utils_py() -> str:
         }
 
 
+        def get_recipe_value(config: dict[str, Any] | None, key: str, default: Any) -> Any:
+            if isinstance(config, dict):
+                recipe = config.get("recipe")
+                if isinstance(recipe, dict) and key in recipe and recipe[key] is not None:
+                    return recipe[key]
+            return default
+
+
         def get_value(config: dict[str, Any] | None, key: str, default: Any) -> Any:
             if isinstance(config, dict):
-                return config.get(key, default)
+                if key in config and config[key] is not None:
+                    return config[key]
+                return get_recipe_value(config, key, default)
             return default
 
 
@@ -806,11 +816,53 @@ def _train_py() -> str:
             from torchvision import transforms
 
             image_size = as_int(get_value(config, "image_size", 224), 224)
-            augmentation = str(get_value(config, "augmentation", "basic") or "basic").lower()
+            augmentation_value = get_value(config, "augmentation", "basic")
             normalize = transforms.Normalize(
                 mean=[0.485, 0.456, 0.406],
                 std=[0.229, 0.224, 0.225],
             )
+            if split == "train" and isinstance(augmentation_value, dict):
+                tier = str(augmentation_value.get("tier", "medium") or "medium").lower()
+                invariance = augmentation_value.get("invariance") or {}
+                scale_min = as_float(invariance.get("crop_scale_min", 0.8), 0.8)
+                scale_min = min(max(scale_min, 0.05), 1.0)
+                ops = [
+                    transforms.RandomResizedCrop(
+                        image_size,
+                        scale=(scale_min, 1.0),
+                        ratio=(0.75, 1.3333333333),
+                    )
+                ]
+                if bool(invariance.get("hflip", False)):
+                    ops.append(transforms.RandomHorizontalFlip())
+                if bool(invariance.get("vflip", False)):
+                    ops.append(transforms.RandomVerticalFlip())
+                if bool(invariance.get("rot90", False)):
+                    ops.append(transforms.RandomChoice([
+                        transforms.RandomRotation((0, 0)),
+                        transforms.RandomRotation((90, 90)),
+                        transforms.RandomRotation((180, 180)),
+                        transforms.RandomRotation((270, 270)),
+                    ]))
+                if bool(invariance.get("randaugment", False)) and hasattr(transforms, "RandAugment"):
+                    ops.append(transforms.RandAugment())
+                if bool(invariance.get("color", False)):
+                    ops.append(transforms.ColorJitter(
+                        brightness=0.2,
+                        contrast=0.2,
+                        saturation=0.2,
+                        hue=0.05,
+                    ))
+                ops.extend([transforms.ToTensor(), normalize])
+                if tier in {"medium", "heavy"} and bool(invariance.get("random_erasing", tier != "light")):
+                    ops.append(transforms.RandomErasing(
+                        p=0.2 if tier == "medium" else 0.3,
+                        scale=(0.02, 0.15),
+                        ratio=(0.3, 3.3),
+                    ))
+                return transforms.Compose(ops)
+
+            augmentation = str(augmentation_value or "basic").lower()
             if split == "train" and augmentation in {"strong", "competition", "advanced"}:
                 return transforms.Compose([
                     transforms.RandomResizedCrop(
@@ -834,6 +886,12 @@ def _train_py() -> str:
                         scale=(0.02, 0.15),
                         ratio=(0.3, 3.3),
                     ),
+                ])
+            if split == "train" and augmentation in {"none", "off", "false"}:
+                return transforms.Compose([
+                    transforms.Resize((image_size, image_size)),
+                    transforms.ToTensor(),
+                    normalize,
                 ])
             if split == "train":
                 return transforms.Compose([
@@ -889,6 +947,48 @@ def _train_py() -> str:
             return train_indices, validation_indices
 
 
+        def _fold_split_indices(frame, image_column, fold_file, fold_index):
+            """外部注入的 paired 折划分：按样本 id 定 val（其余 train），带完整性校验。
+
+            fold_file JSON: {"folds": [[val_id, ...], ...], ...}（每折 = 该折 val 的 id 列表）。
+            两臂引用同一 fold_file + 同一 fold_index → val 集完全一致（paired 保证）。
+            """
+            import json as _json
+            with open(fold_file, "r", encoding="utf-8") as _fh:
+                spec = _json.load(_fh)
+            folds = spec["folds"]
+            expected_id_column = spec.get("id_column")
+            if expected_id_column and str(expected_id_column) != str(image_column):
+                raise ValueError(
+                    f"fold_file id_column={expected_id_column!r} does not match image_column={image_column!r}"
+                )
+            declared_n_folds = spec.get("n_folds")
+            if declared_n_folds is not None and int(declared_n_folds) != len(folds):
+                raise ValueError(
+                    f"fold_file n_folds={declared_n_folds} but contains {len(folds)} folds"
+                )
+            if not 0 <= fold_index < len(folds):
+                raise ValueError(f"fold_index {fold_index} out of range 0..{len(folds) - 1}")
+            all_ids = [str(v) for v in frame[image_column].tolist()]
+            id_set = set(all_ids)
+            seen: set = set()
+            union: set = set()
+            for one in folds:
+                fs = {str(x) for x in one}
+                if seen & fs:
+                    raise ValueError("fold_file 有交集：同一 id 出现在多折")
+                seen |= fs
+                union |= fs
+            if union != id_set:
+                raise ValueError(
+                    f"fold_file 与 CSV id 不一致：缺 {len(id_set - union)} 多 {len(union - id_set)}"
+                )
+            val_ids = {str(x) for x in folds[fold_index]}
+            train_indices = [i for i, x in enumerate(all_ids) if x not in val_ids]
+            validation_indices = [i for i, x in enumerate(all_ids) if x in val_ids]
+            return train_indices, validation_indices
+
+
         def _build_local_dataloader(config: dict[str, Any], split: str, batch_size: int, deterministic: bool = False):
             train_csv = str(get_value(config, "train_csv", "") or "").strip()
             image_dir = str(get_value(config, "image_dir", "") or "").strip()
@@ -924,11 +1024,19 @@ def _train_py() -> str:
                 unique_labels = sorted(set(label_values), key=lambda value: str(value))
                 label_to_index = {value: index for index, value in enumerate(unique_labels)}
                 encoded_labels = [label_to_index[value] for value in label_values]
-                train_indices, validation_indices = _split_indices(
-                    encoded_labels,
-                    validation_fraction=validation_fraction,
-                    seed=seed,
-                )
+                fold_file = str(get_value(config, "fold_file", "") or "").strip()
+                fold_index = get_value(config, "fold_index", None)
+                if fold_file and fold_index is not None:
+                    # 外部 paired 折划分（旁路内部 val_split）
+                    train_indices, validation_indices = _fold_split_indices(
+                        frame, image_column, fold_file, int(fold_index)
+                    )
+                else:
+                    train_indices, validation_indices = _split_indices(
+                        encoded_labels,
+                        validation_fraction=validation_fraction,
+                        seed=seed,
+                    )
                 selected_indices = train_indices if split == "train" else validation_indices
                 if max_samples > 0:
                     selected_indices = selected_indices[:max_samples]
@@ -1901,6 +2009,19 @@ def _evaluate_py() -> str:
                         )
                 except (ImportError, ValueError) as exc:
                     print(f"[evaluate] Could not compute {requested_metric}: {exc}; using accuracy.")
+                export_path = str(get_value(config, "export_preds_path", "") or "").strip()
+                if export_path:
+                    # 导出 val 预测供离线算指标 bundle（macro_f1 / roc_auc / pr_auc）
+                    import json as _json
+                    with open(export_path, "w", encoding="utf-8") as _fh:
+                        _json.dump(
+                            {
+                                "y_true": labels.tolist(),
+                                "y_prob": probabilities.tolist(),
+                                "y_score": probabilities.tolist(),
+                            },
+                            _fh,
+                        )
                 return {
                     "metric_name": metric_name,
                     "metric_value": metric_value,
@@ -2117,7 +2238,7 @@ def _run_py(first_config_json: str) -> str:
         from evaluate import evaluate
         from infer import predict
         from train import train_model
-        from utils import as_bool, as_int, compact_config_summary, get_value, load_config, set_seed
+        from utils import as_bool, as_int, compact_config_summary, get_recipe_value, get_value, load_config, set_seed
 
 
         DEFAULT_CONFIG = json.loads(__DEFAULT_CONFIG_JSON__)
@@ -2140,7 +2261,8 @@ def _run_py(first_config_json: str) -> str:
                 config["dataset_id"] = args.dataset
 
             offline_smoke = as_bool(get_value(config, "offline_smoke", True), True)
-            default_epochs = 1 if offline_smoke else as_int(get_value(config, "recommended_epochs", 10), 10)
+            recipe_epochs = get_recipe_value(config, "epochs", 10)
+            default_epochs = 1 if offline_smoke else as_int(get_value(config, "recommended_epochs", recipe_epochs), 10)
             epochs = args.epochs if args.epochs is not None else default_epochs
             max_steps = 1 if offline_smoke else 0
 
@@ -2177,7 +2299,7 @@ def _run_experiments_py(configs_json: str) -> str:
 
         from evaluate import evaluate
         from train import train_model
-        from utils import as_bool, as_int, compact_config_summary, get_value, load_configs, set_seed
+        from utils import as_bool, as_int, compact_config_summary, get_recipe_value, get_value, load_configs, set_seed
 
 
         DEFAULT_CONFIGS = json.loads(__DEFAULT_CONFIGS_JSON__)
@@ -2188,7 +2310,8 @@ def _run_experiments_py(configs_json: str) -> str:
             for index, config in enumerate(configs, start=1):
                 set_seed(seed)
                 offline_smoke = as_bool(get_value(config, "offline_smoke", True), True)
-                default_ep = 1 if offline_smoke else as_int(get_value(config, "recommended_epochs", 10), 10)
+                recipe_epochs = get_recipe_value(config, "epochs", 10)
+                default_ep = 1 if offline_smoke else as_int(get_value(config, "recommended_epochs", recipe_epochs), 10)
                 ep = epochs if epochs is not None else default_ep
                 ms = 1 if offline_smoke else 0
                 model, train_result = train_model(config, epochs=ep, max_steps=ms)
